@@ -49,8 +49,16 @@ def _cascade_path():
 
 
 # ---------------------------------------------------------------- 检测
+def _is_skin_like(box):
+    """肤色校验：过滤 Haar 误检。RGB 平均满足 R>G>B 且偏暖色。"""
+    r = box[..., 0].astype(np.float32).mean()
+    g = box[..., 1].astype(np.float32).mean()
+    b = box[..., 2].astype(np.float32).mean()
+    return r > g > b and (r - b) > 15 and 60 < r < 255
+
+
 def detect_face(img):
-    """检测人脸，返回 (cx, cy, size) 或 None。"""
+    """检测人脸，返回 (cx, cy, size) 或 None。参数放宽 + 肤色校验过滤误检。"""
     if not _HAS_CV2:
         return None
     p = _cascade_path()
@@ -58,24 +66,36 @@ def detect_face(img):
         return None
     try:
         cascade = cv2.CascadeClassifier(p)
-        gray = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2GRAY)
-        min_size = max(30, min(img.size) // 30)
-        faces = cascade.detectMultiScale(gray, 1.1, 5, minSize=(min_size, min_size))
-        if len(faces) == 0:
+        arr = np.asarray(img)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        min_size = max(40, min(img.size) // 100)
+        # scaleFactor=1.05：尺度步长更细，避免漏检（1.1 会跳过部分人脸尺度）
+        faces = cascade.detectMultiScale(gray, 1.05, 3, minSize=(min_size, min_size))
+        good = [(x, y, w, h) for (x, y, w, h) in faces if _is_skin_like(arr[y:y + h, x:x + w])]
+        if not good:
             return None
-        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        x, y, w, h = max(good, key=lambda f: f[2] * f[3])
         return (x + w / 2, y + h / 2, max(w, h))
     except Exception:
         return None
 
 
 def crop_square(img, face=None):
-    """裁成方形。有脸则围绕人脸裁剪（脸约占图纸宽 60%），否则居中裁方。"""
+    """裁成方形。有脸则围绕人脸裁剪，否则居中裁方。
+    脸在成品中占比自适应：特写 0.6（紧）→ 远景小脸 0.3（放宽，包含身体），避免过度放大。"""
     w, h = img.size
     if face:
         fx, fy, fs = face
-        side = int(fs / 0.6)
-        side = min(max(side, 80), min(w, h))   # 至少 80px，且不超出图幅
+        min_dim = min(w, h)
+        f = fs / min_dim
+        if f >= 0.2:
+            ratio = 0.6
+        elif f <= 0.05:
+            ratio = 0.3
+        else:
+            ratio = 0.3 + (f - 0.05) / 0.15 * 0.3
+        side = int(fs / ratio)
+        side = min(max(side, 80), min_dim)   # 至少 80px，且不超出图幅
         left = int(max(0, min(fx - side / 2, w - side)))
         top = int(max(0, min(fy - side / 2, h - side)))
         return img.crop((left, top, left + side, top + side)), True
