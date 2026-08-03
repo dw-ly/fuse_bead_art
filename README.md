@@ -1,1 +1,44 @@
-# fuse_bead_art
+# fuse_bead_art · 照片转拼豆图纸
+
+把照片转换成拼豆（MIDI beads）图纸：**能分辨图片内容，豆量可控（上限 60×60）**。
+
+## 快速开始
+
+**浏览器 UI（推荐，无需安装）**：双击打开 `ui/pindou.html`，拖入照片 → 自动生成 → 一键下载 ZIP 素材包（预览图 + 施工图 + 用量清单）。
+
+**Python CLI**：
+
+```bash
+pip install pillow numpy
+python scripts/photo2beads.py 照片.jpg -N 60              # 默认 MARD 291 色板 + kmeans 主色聚类
+python scripts/photo2beads.py 照片.jpg -N 49 -p hama -m nearest -L
+```
+
+## 生成内容
+
+| 文件 | 说明 |
+|---|---|
+| `*_preview.png` | 圆角豆粒成品预览（`-L` 可标注色号） |
+| `*_spec.png` | 带色号标注 + 坐标刻度的施工图（可打印对照） |
+| `*_usage.csv` | 各色号用量清单（配豆对账用） |
+
+## 核心特性
+
+- **CIELAB + ΔE76 色差量化**——不是 RGB 最近色，符合人眼感知
+- **6 个品牌共 1094 个真实色号**（MARD 291 / Artkal / Perler / Hama…），色号表可配置
+- 两种量化：**k-means 主色聚类**（照片推荐）/ **直接最近色**
+- **色号子集筛选**：只用你实际拥有的豆子颜色（`--only A1,B2`）
+- 浏览器端**零后端**：图片不上传服务器，纯本地处理，可离线使用
+
+## 目录
+
+```
+scripts/    Python 工具（CLI + 色号解析）
+ui/         浏览器 UI（纯 HTML/JS，零依赖，含手写 ZIP 打包）
+data/       色号库（6 品牌 1094 色，JSON）
+docs/       调研与实现方案文档
+```
+
+## 技术细节
+
+算法管线与分辨率/豆量的权衡分析见 [docs/拼豆像素图生成方案.md](docs/拼豆像素图生成方案.md)。
