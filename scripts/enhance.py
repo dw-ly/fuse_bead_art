@@ -22,15 +22,15 @@ except ImportError:
 
 # ---------------------------------------------------------------- 预设定义
 # blur=边缘感知背景柔化强度(0关闭) sat=饱和度倍率 sharpen=锐化强度 denoise=降噪强度
-# face=是否做人脸检测居中裁剪 cartoon=是否卡通化
+# face=是否做人脸检测 center=是否按主体质心居中(风景/插画/通用不居中) cartoon=是否卡通化
 PRESETS = {
-    '通用':       dict(blur=0.0, sat=1.00, sharpen=0.0, denoise=0.0, cartoon=False, face=False),
-    '人像':       dict(blur=0.9, sat=0.95, sharpen=0.6, denoise=0.4, cartoon=False, face=True),
-    '风景':       dict(blur=0.0, sat=1.10, sharpen=0.0, denoise=0.4, cartoon=False, face=False),
-    '花':         dict(blur=1.2, sat=1.15, sharpen=0.8, denoise=0.0, cartoon=False, face=False),
-    '动物':       dict(blur=0.8, sat=1.05, sharpen=0.6, denoise=0.3, cartoon=False, face=False),
-    '插画':       dict(blur=0.0, sat=1.05, sharpen=0.5, denoise=0.0, cartoon=False, face=False),
-    '人像转插画': dict(blur=0.0, sat=1.10, sharpen=0.0, denoise=0.0, cartoon=True,  face=True),
+    '通用':       dict(blur=0.0, sat=1.00, sharpen=0.0, denoise=0.0, cartoon=False, face=False, center=False),
+    '人像':       dict(blur=0.9, sat=0.95, sharpen=0.6, denoise=0.4, cartoon=False, face=True,  center=True),
+    '风景':       dict(blur=0.0, sat=1.10, sharpen=0.0, denoise=0.4, cartoon=False, face=False, center=False),
+    '花':         dict(blur=1.2, sat=1.15, sharpen=0.8, denoise=0.0, cartoon=False, face=False, center=True),
+    '动物':       dict(blur=0.8, sat=1.05, sharpen=0.6, denoise=0.3, cartoon=False, face=False, center=True),
+    '插画':       dict(blur=0.0, sat=1.05, sharpen=0.5, denoise=0.0, cartoon=False, face=False, center=False),
+    '人像转插画': dict(blur=0.0, sat=1.10, sharpen=0.0, denoise=0.0, cartoon=True,  face=True,  center=True),
 }
 PRESET_ORDER = ['通用', '人像', '风景', '花', '动物', '插画', '人像转插画']
 
@@ -80,27 +80,58 @@ def detect_face(img):
         return None
 
 
-def crop_square(img, face=None):
-    """裁成方形。有脸则围绕人脸裁剪，否则居中裁方。
-    脸在成品中占比自适应：特写 0.6（紧）→ 远景小脸 0.3（放宽，包含身体），避免过度放大。"""
+def _edge_centroid(img):
+    """边缘加权质心：主体位置（边缘密集处），对口罩/角度免疫。
+    在缩小到 400px 内计算（加速 + 抑制噪点），再映射回原坐标。"""
+    if not _HAS_CV2:
+        return (img.width / 2, img.height / 2)
+    small = np.asarray(img.resize((min(img.width, 400), min(img.height, 400)), Image.LANCZOS))
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1)
+    edge = cv2.magnitude(gx, gy)
+    h, w = edge.shape
+    ys, xs = np.mgrid[0:h, 0:w]
+    wsum = float(edge.sum()) + 1e-6
+    cx = float((xs * edge).sum()) / wsum
+    cy = float((ys * edge).sum()) / wsum
+    return (cx * img.width / w, cy * img.height / h)
+
+
+def crop_square(img, face=None, center_on_subject=True):
+    """裁成方形。
+
+    - 有可靠人脸（脸/短边≥0.08 且与主体质心一致）→ 按脸裁剪（自适应比例）
+    - 否则 center_on_subject=True → 以边缘质心（主体位置）为中心裁方，主体居中更稳
+    - 否则 → 纯居中裁方
+    """
     w, h = img.size
-    if face:
+    min_dim = min(w, h)
+
+    if face is not None and face[2] / min_dim >= 0.08:
         fx, fy, fs = face
-        min_dim = min(w, h)
-        f = fs / min_dim
-        if f >= 0.2:
-            ratio = 0.6
-        elif f <= 0.05:
-            ratio = 0.3
-        else:
-            ratio = 0.3 + (f - 0.05) / 0.15 * 0.3
-        side = int(fs / ratio)
-        side = min(max(side, 80), min_dim)   # 至少 80px，且不超出图幅
-        left = int(max(0, min(fx - side / 2, w - side)))
-        top = int(max(0, min(fy - side / 2, h - side)))
-        return img.crop((left, top, left + side, top + side)), True
-    side = min(w, h)
-    return img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2)), False
+        cx, cy = _edge_centroid(img)
+        # 一致性校验：脸与主体质心相距过远 → 疑似误检，回退主体质心裁方
+        if abs(fx - cx) <= 0.15 * min_dim and abs(fy - cy) <= 0.25 * min_dim:
+            f = fs / min_dim
+            if f >= 0.2:
+                ratio = 0.6
+            elif f <= 0.05:
+                ratio = 0.3
+            else:
+                ratio = 0.3 + (f - 0.05) / 0.15 * 0.3
+            side = int(fs / ratio)
+            side = min(max(side, 80), min_dim)
+            left = int(max(0, min(fx - side / 2, w - side)))
+            top = int(max(0, min(fy - side / 2, h - side)))
+            return img.crop((left, top, left + side, top + side)), True
+
+    # 主体质心居中（或纯居中）
+    cx, cy = _edge_centroid(img) if center_on_subject else (w / 2, h / 2)
+    side = min_dim
+    left = int(max(0, min(cx - side / 2, w - side)))
+    top = int(max(0, min(cy - side / 2, h - side)))
+    return img.crop((left, top, left + side, top + side)), False
 
 
 # ---------------------------------------------------------------- 增强操作
@@ -184,12 +215,15 @@ def apply_preset(img, preset, log=None):
     if preset == '通用' or not _HAS_CV2:
         if preset != '通用' and not _HAS_CV2:
             log('[警告] 未安装 OpenCV，预设增强不可用，已回退到通用处理', True)
-        return crop_square(img)[0]
+        return crop_square(img, center_on_subject=False)[0]
 
     face = detect_face(img) if cfg['face'] else None
+    img, used_face = crop_square(img, face, center_on_subject=cfg['center'])
     if cfg['face']:
-        log(f'人脸检测：{"检测到，按脸居中裁剪" if face else "未检测到，用中心裁剪"}')
-    img, _ = crop_square(img, face)
+        if used_face:
+            log('人脸检测：检测到可靠人脸，按脸居中裁剪')
+        else:
+            log('人脸检测：未采用人脸（不存在或置信度不足/与主体不一致），按主体质心定位')
 
     if cfg['cartoon']:
         log(f'卡通化处理（{preset}）')
