@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>拼豆图纸生成器</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+         background: #f4f6f9; color: #222; }
+  .topbar { background: linear-gradient(135deg, #ff8a5c, #ff5e62); color: #fff;
+            padding: 14px 24px; font-size: 18px; font-weight: 600; }
+  .topbar small { font-weight: 400; opacity: .85; margin-left: 10px; font-size: 13px; }
+  .wrap { display: flex; gap: 16px; padding: 16px; align-items: flex-start; }
+  .side { width: 300px; flex: 0 0 300px; background: #fff; border-radius: 10px;
+          padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.06); position: sticky; top: 16px; }
+  .main { flex: 1; min-width: 0; }
+  h3 { font-size: 14px; margin: 14px 0 6px; color: #555; }
+  h3:first-child { margin-top: 0; }
+  #drop-zone { border: 2px dashed #ccd; border-radius: 10px; padding: 22px 10px;
+               text-align: center; color: #778; cursor: pointer; font-size: 14px;
+               transition: all .15s; }
+  #drop-zone:hover, #drop-zone.dragging { border-color: #ff5e62; background: #fff5f4; color: #d64; }
+  #orig-wrap { display: none; margin-top: 10px; text-align: center; }
+  #orig-wrap img { max-width: 100%; max-height: 120px; border-radius: 6px; }
+  #orig-wrap div { font-size: 12px; color: #889; margin-top: 4px; }
+  label.row { display: flex; align-items: center; justify-content: space-between;
+              margin: 8px 0; font-size: 13px; color: #333; }
+  select, input[type=number], input[type=text] { border: 1px solid #d5d9e0; border-radius: 6px;
+              padding: 6px 8px; font-size: 13px; width: 150px; }
+  input[type=number] { width: 80px; }
+  input[type=text] { width: 150px; }
+  #grid-custom-wrap { display: none; }
+  .radio-group { display: flex; gap: 14px; font-size: 13px; }
+  .radio-group label { display: flex; align-items: center; gap: 4px; }
+  .chk { display: flex; align-items: center; gap: 6px; font-size: 13px; margin: 8px 0; }
+  #gen-btn { width: 100%; margin-top: 16px; padding: 11px; border: 0; border-radius: 8px;
+             background: linear-gradient(135deg, #ff8a5c, #ff5e62); color: #fff; font-size: 15px;
+             font-weight: 600; cursor: pointer; }
+  #gen-btn:disabled { opacity: .6; cursor: wait; }
+  .card { background: #fff; border-radius: 10px; padding: 14px 16px; margin-bottom: 16px;
+          box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  #metrics { font-size: 14px; }
+  .good { color: #1a9a4c; } .bad { color: #d0342c; }
+  .result-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .result-head b { font-size: 14px; }
+  .dl { padding: 6px 12px; border: 1px solid #d5d9e0; border-radius: 6px; background: #fff;
+        cursor: pointer; font-size: 13px; color: #333; white-space: nowrap; }
+  .dl:disabled { opacity: .4; cursor: default; }
+  .dl:hover:not(:disabled) { border-color: #ff5e62; color: #d64; }
+  .dl.primary { background: linear-gradient(135deg, #ff8a5c, #ff5e62); color: #fff; border: 0; }
+  .dl.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.06); }
+  .dl-group { display: flex; gap: 8px; flex-shrink: 0; margin-left: 12px; }
+  .canvas-scroll { overflow: auto; max-height: 68vh; border: 1px solid #eef0f3; border-radius: 8px; }
+  canvas { display: block; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .hint { font-size: 12px; color: #889; margin-top: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #eef0f3; text-align: left; }
+  th { color: #667; font-weight: 600; background: #fafbfc; }
+  .swatch { display: inline-block; width: 14px; height: 14px; border-radius: 3px;
+            vertical-align: -2px; margin-right: 8px; border: 1px solid rgba(0,0,0,.1); }
+  .usage-scroll { max-height: 40vh; overflow: auto; }
+  @media (max-width: 900px) {
+    .wrap { flex-direction: column; }
+    .side { width: 100%; position: static; }
+    .two-col { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="topbar">🧩 拼豆图纸生成器 <small>照片 → 拼豆图纸 · 本地运行，图片不上传服务器</small></div>
+
+<div class="wrap">
+  <div class="side">
+    <h3>① 上传照片</h3>
+    <div id="drop-zone">点击选择 或 拖拽照片到这里</div>
+    <input type="file" id="file-input" accept="image/*" style="display:none">
+    <div id="orig-wrap">
+      <img id="orig-thumb" alt="原图缩略"><div id="orig-name"></div>
+    </div>
+
+    <h3>② 参数设置</h3>
+    <label class="row"><span>网格大小（豆数）</span>
+      <span>
+        <select id="grid-select">
+          <option value="29">29×29（841豆）</option>
+          <option value="39">39×39（1521豆）</option>
+          <option value="49">49×49（2401豆）</option>
+          <option value="60" selected>60×60（3600豆）</option>
+          <option value="custom">自定义…</option>
+        </select>
+        <span id="grid-custom-wrap"><input type="number" id="grid-custom" min="1" max="60" value="60"></span>
+      </span>
+    </label>
+    <label class="row"><span>色板品牌</span>
+      <select id="brand-select"></select>
+    </label>
+    <label class="row"><span>只用这些色号</span>
+      <input type="text" id="subset-input" placeholder="如 A1,B2,F3（留空=全色板）">
+    </label>
+    <h3>③ 量化方式</h3>
+    <div class="radio-group">
+      <label><input type="radio" name="method" id="method-kmeans" checked>主色聚类（照片推荐）</label>
+      <label><input type="radio" name="method" id="method-nearest">最近色</label>
+    </div>
+    <label class="row"><span>主色数 k</span>
+      <input type="number" id="k-input" min="2" max="60" value="32">
+    </label>
+    <label class="chk"><input type="checkbox" id="label-check">预览图标注色号</label>
+    <button id="gen-btn">生成图纸</button>
+  </div>
+
+  <div class="main">
+    <div class="card">
+      <div class="result-head">
+        <div id="metrics">请上传照片，或调整参数后点"生成图纸"。图片只在本地浏览器处理，不会上传。</div>
+        <div class="dl-group">
+          <button class="dl" id="download-all" disabled>💾 全部素材</button>
+          <button class="dl primary" id="download-zip" disabled>📦 下载 ZIP 素材包</button>
+        </div>
+      </div>
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <div class="result-head"><b>成品预览</b><button class="dl" id="download-preview" disabled>下载 PNG</button></div>
+        <div class="canvas-scroll"><canvas id="preview-canvas"></canvas></div>
+        <div class="hint">圆角豆粒效果。勾选"标注色号"可显示每颗豆的色号。</div>
+      </div>
+      <div class="card">
+        <div class="result-head"><b>施工图（带色号）</b><button class="dl" id="download-spec" disabled>下载 PNG</button></div>
+        <div class="canvas-scroll"><canvas id="spec-canvas"></canvas></div>
+        <div class="hint">每格带色号与边缘坐标刻度，可打印对照拼。</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="result-head"><b>配豆用量清单</b><button class="dl" id="download-csv" disabled>下载 CSV</button></div>
+      <div class="usage-scroll"><table>
+        <thead><tr><th>色号</th><th>Hex</th><th>用量（颗）</th></tr></thead>
+        <tbody id="usage-body"></tbody>
+      </table></div>
+    </div>
+  </div>
+</div>
+
+<script src="palettes.js"></script>
+<script src="core.js"></script>
+<script src="zip.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
