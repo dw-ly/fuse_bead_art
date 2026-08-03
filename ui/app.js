@@ -10,6 +10,7 @@
   var gridCustomWrap = $('grid-custom-wrap');
   var gridCustom = $('grid-custom');
   var brandSelect = $('brand-select');
+  var presetSelect = $('preset-select');
   var subsetInput = $('subset-input');
   var methodKmeans = $('method-kmeans');
   var methodNearest = $('method-nearest');
@@ -57,6 +58,17 @@
       if (!window.ZipBuilder) {
         throw new Error('zip.js 未加载，请确认它与本页面在同一目录');
       }
+      if (!window.BeadsEnhance) {
+        throw new Error('enhance.js 未加载，请确认它与本页面在同一目录');
+      }
+      // 预设下拉
+      window.BeadsEnhance.PRESET_ORDER.forEach(function (name) {
+        var opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        presetSelect.appendChild(opt);
+      });
+      presetSelect.value = '通用';
       // 色板下拉
       Object.keys(window.PALETTES).forEach(function (key) {
         var opt = document.createElement('option');
@@ -93,7 +105,7 @@
     });
     genBtn.addEventListener('click', generate);
     ['change', 'input'].forEach(function (ev) {
-      [gridSelect, gridCustom, brandSelect, subsetInput, methodKmeans, methodNearest, kInput, labelCheck]
+      [gridSelect, gridCustom, brandSelect, presetSelect, subsetInput, methodKmeans, methodNearest, kInput, labelCheck]
         .forEach(function (el) { el.addEventListener(ev, generate); });
     });
     // 下载
@@ -184,7 +196,7 @@
   }
 
   // ---- 读取图片 → 缩放到 N×N RGBA（带超时，防止卡在"生成中"） ----
-  function readImageData(file, N) {
+  function loadImage(file) {
     return new Promise(function (resolve, reject) {
       var url = URL.createObjectURL(file);
       var img = new Image();
@@ -195,22 +207,8 @@
       img.onload = function () {
         if (done) return;
         done = true; clearTimeout(timer);
-        try {
-          var side = Math.min(img.naturalWidth, img.naturalHeight);
-          var sx = (img.naturalWidth - side) / 2;
-          var sy = (img.naturalHeight - side) / 2;
-          var c = document.createElement('canvas');
-          c.width = N; c.height = N;
-          var ctx = c.getContext('2d');
-          ctx.imageSmoothingEnabled = true;
-          ctx.imageSmoothingQuality = 'high';
-          ctx.drawImage(img, sx, sy, side, side, 0, 0, N, N);
-          resolve(ctx.getImageData(0, 0, N, N).data);
-        } catch (e2) {
-          reject(e2);
-        } finally {
-          URL.revokeObjectURL(url);
-        }
+        URL.revokeObjectURL(url);
+        resolve(img);
       };
       img.onerror = function () {
         if (done) return;
@@ -218,6 +216,21 @@
         reject(new Error('无法读取该图片（格式不支持？）'));
       };
       img.src = url;
+    });
+  }
+
+  function readImageData(file, N) {
+    return loadImage(file).then(function (img) {
+      var side = Math.min(img.naturalWidth, img.naturalHeight);
+      var sx = (img.naturalWidth - side) / 2;
+      var sy = (img.naturalHeight - side) / 2;
+      var c = document.createElement('canvas');
+      c.width = N; c.height = N;
+      var ctx = c.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, sx, sy, side, side, 0, 0, N, N);
+      return ctx.getImageData(0, 0, N, N).data;
     });
   }
 
@@ -236,10 +249,20 @@
       var only = subsetInput.value.trim() || null;
       var method = methodNearest.checked ? 'nearest' : 'kmeans';
       var k = parseInt(kInput.value, 10) || 16;
-      var rawRGBA = await readImageData(currentFile, N);
+      var preset = presetSelect.value;
+      var rawRGBA, steps = [];
+      if (preset === '通用') {
+        rawRGBA = await readImageData(currentFile, N);
+      } else {
+        var img = await loadImage(currentFile);
+        var enhanced = window.BeadsEnhance.processImageWithPreset(img, preset, N, 512);
+        rawRGBA = enhanced.imageData.data;
+        steps = enhanced.steps;
+      }
       var res = window.BeadsCore.processImage(window.PALETTES, brand, only, rawRGBA, N, method, k, SEED);
       current = { grid: res.grid, counts: res.counts, colors: res.colors,
-                  unique: res.unique, avgDE: res.avgDE, N: N, brand: brand };
+                  unique: res.unique, avgDE: res.avgDE, N: N, brand: brand,
+                  preset: preset, steps: steps };
       renderAll();
     } catch (e) {
       showStatus('出错：' + e.message, true);
@@ -263,10 +286,13 @@
     drawSpec(specCanvas.getContext('2d'), specCanvas, g);
     // 指标
     var warn = g.avgDE > 15;
+    var presetInfo = g.preset && g.preset !== '通用'
+      ? ' ｜ 预设 <b>' + g.preset + '</b>' + (g.steps && g.steps.length ? '（' + g.steps.join('、') + '）' : '')
+      : '';
     metricsEl.innerHTML = '网格 <b>' + g.N + '×' + g.N + '</b> = <b>' + (g.N * g.N) +
       '</b> 颗豆 ｜ 用色 <b>' + g.unique + '</b> 种 ｜ 平均色差 ΔE = <b>' + g.avgDE.toFixed(1) + '</b> ' +
       (warn ? '<span class="bad">(超过建议阈值 15，建议加大网格)</span>'
-            : '<span class="good">(达标，可接受)</span>');
+            : '<span class="good">(达标，可接受)</span>') + presetInfo;
     // 用量表
     usageTableBody.innerHTML = '';
     g.counts.forEach(function (c) {
