@@ -9,10 +9,23 @@
 **Python CLI**：
 
 ```bash
-pip install pillow numpy
+pip install -r requirements.txt
 python scripts/photo2beads.py 照片.jpg -N 60              # 默认 MARD 291 色板 + kmeans 主色聚类
 python scripts/photo2beads.py 照片.jpg -N 49 -p hama -m nearest -L
+python scripts/photo2beads.py 照片.jpg -N 60 --preset 花   # 按照片主题自动增强
 ```
+
+**主题预设**（`--preset`，按主体自动优化）：
+
+| 预设 | 处理 |
+|---|---|
+| `人像` | 人脸居中裁剪（OpenCV）+ 背景柔化 + 肤色自然 |
+| `花` | 强背景柔化 + 饱和提升 + 锐化 |
+| `动物` | 背景柔化 + 适度增强 |
+| `风景` | 轻降噪 + 饱和提升（不柔化） |
+| `插画` | 轻锐化 + 提饱和（适合已扁平的图） |
+| `人像转插画` | 卡通化：压平 + 颜色分级 + 勾轮廓线 |
+| `通用` | 直接转换，不做增强 |
 
 ## 生成内容
 

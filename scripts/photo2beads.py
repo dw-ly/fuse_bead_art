@@ -26,6 +26,8 @@ import sys
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from enhance import PRESETS, apply_preset
+
 # 色号库路径（项目数据资产，由 parse_palette.py 生成）
 PALETTE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "bead_palettes.json")
 MAX_GRID = 60  # 本项目按 60×60 以内做
@@ -192,12 +194,11 @@ def draw_spec(grid, palette, counts):
 
 
 # ---------------------------------------------------------------- 主流程
-def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, labels=False):
-    # 1. 读图 + 裁方 + 缩小
+def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, labels=False, preset='通用'):
+    # 1. 读图 + 预设增强(裁剪+柔化/卡通化等) + 缩小
     img = Image.open(image_path).convert("RGB")
-    w, h = img.size
-    side = min(w, h)
-    img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+    steps = []
+    img = apply_preset(img, preset, log=lambda m, is_err=False: steps.append((m, is_err)))
     img = img.resize((n, n), Image.LANCZOS)
     rgb = np.asarray(img)  # (n, n, 3) uint8
 
@@ -235,6 +236,9 @@ def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, label
         w.writerows(counts)
 
     print(f"网格: {n}×{n} = {n * n} 颗豆  |  色板: {brand}（{len(palette)} 色可用，实际用 {unique} 色）")
+    print(f"预设: {preset}" + (f" ｜ 处理: {'；'.join(m for m, e in steps if not e)}" if steps else ""))
+    if any(e for _, e in steps):
+        print("[警告] " + "；".join(m for m, e in steps if e))
     print(f"量化方法: {method}{'(k=' + str(k) + ')' if method == 'kmeans' else ''}  |  平均每豆色差 ΔE = {avg_de:.1f}")
     print(f"输出: {out_prefix}_preview.png / _spec.png / _usage.csv")
     if avg_de > 15:
@@ -251,6 +255,8 @@ def main():
     ap.add_argument("-p", "--palette", default="mard291", choices=BRANDS, help="色板品牌，默认 mard291")
     ap.add_argument("-m", "--method", default="kmeans", choices=["nearest", "kmeans"],
                     help="量化方法：nearest=直接最近色；kmeans=主色聚类(照片推荐，默认)")
+    ap.add_argument("--preset", default="通用", choices=list(PRESETS.keys()),
+                    help="照片主题预设：人像/风景/花/动物/插画/人像转插画/通用（按主题自动增强）")
     ap.add_argument("-k", type=int, default=16, help="k-means 主色数，默认 16")
     ap.add_argument("--only", help="仅使用指定色号，逗号分隔，如 A1,B2,F3（不填=全色板）")
     ap.add_argument("-o", "--out", default=None, help="输出前缀（默认=输入文件名）")
@@ -273,7 +279,7 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         print(f"已创建输出目录: {out_dir}", file=sys.stderr)
     process(args.image, args.N, args.palette, args.method, args.k,
-            args.only, out_prefix, args.cell, args.seed, labels=args.labels)
+            args.only, out_prefix, args.cell, args.seed, labels=args.labels, preset=args.preset)
 
 
 if __name__ == "__main__":
