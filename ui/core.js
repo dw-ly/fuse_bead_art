@@ -143,7 +143,8 @@
            0.114 * parseInt(hex.slice(5, 7), 16);
   }
 
-  // 去孤立杂点：周围 8 格没有同色（完全孤立）的格子，替换成邻域主色
+  // 去孤立杂点：只清"嵌在实心区里的散点"——周围 8 格无同色，且某一邻域色占绝对多数(≥半)。
+  // 这样保护线条/纹理/过渡色：卡通插画这类本就平滑的图不会误删细节。
   function cleanIsolated(grid, N) {
     var out = new Int32Array(grid);
     for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) {
@@ -162,7 +163,7 @@
       if (total >= 3 && same === 0) {
         var best = c, bc = 0;
         for (var kk in counts) { if (counts[kk] > bc) { bc = counts[kk]; best = +kk; } }
-        out[i] = best;
+        if (bc >= Math.max(3, Math.ceil(total / 2))) out[i] = best;
       }
     }
     return out;

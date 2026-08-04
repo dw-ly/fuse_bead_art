@@ -118,7 +118,8 @@ def luminance_hex(hexc):
 
 
 def clean_isolated(grid):
-    """去孤立杂点：周围 8 格无同色的格子替换为邻域主色。"""
+    """去孤立杂点：只清"嵌在实心区里的散点"——周围 8 格无同色，且某一邻域色占绝对多数(≥半)。
+    保护线条/纹理/过渡色，卡通插画这类本就平滑的图不会误删细节。"""
     n = grid.shape[0]
     out = grid.copy()
     for y in range(n):
@@ -129,9 +130,10 @@ def clean_isolated(grid):
             if nb.size <= 1:
                 continue
             center = grid[y, x]
-            if (nb != center).sum() == nb.size - 1:  # 所有邻域都不同色 → 孤立
+            if (nb != center).sum() == nb.size - 1:  # 所有邻域都不同色 → 候选孤立
                 vals, cnts = np.unique(nb, return_counts=True)
-                out[y, x] = vals[int(np.argmax(cnts))]
+                if int(cnts.max()) >= max(3, nb.size // 2):  # 邻域主色占多数才替换(保护线条)
+                    out[y, x] = vals[int(np.argmax(cnts))]
     return out
 
 
