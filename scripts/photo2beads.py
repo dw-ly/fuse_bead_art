@@ -111,6 +111,49 @@ def quantize_kmeans(lab_img, pal_lab, k, seed):
     return cd.argmin(axis=-1)[labels].reshape(lab_img.shape[:2])
 
 
+# ---------------------------------------------------------------- 像素级后处理
+def luminance_hex(hexc):
+    r, g, b = int(hexc[1:3], 16), int(hexc[3:5], 16), int(hexc[5:7], 16)
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def clean_isolated(grid):
+    """去孤立杂点：周围 8 格无同色的格子替换为邻域主色。"""
+    n = grid.shape[0]
+    out = grid.copy()
+    for y in range(n):
+        for x in range(n):
+            y0, y1 = max(0, y - 1), min(n - 1, y + 1)
+            x0, x1 = max(0, x - 1), min(n - 1, x + 1)
+            nb = grid[y0:y1 + 1, x0:x1 + 1]
+            if nb.size <= 1:
+                continue
+            center = grid[y, x]
+            if (nb != center).sum() == nb.size - 1:  # 所有邻域都不同色 → 孤立
+                vals, cnts = np.unique(nb, return_counts=True)
+                out[y, x] = vals[int(np.argmax(cnts))]
+    return out
+
+
+def add_outline(grid, palette, threshold=45):
+    """卡通描边：4 邻域明暗差超过阈值 → 涂成色板最深色（形成轮廓线）。"""
+    n = grid.shape[0]
+    lums = np.array([luminance_hex(c[1]) for c in palette])
+    dark = int(np.argmin(lums))
+    out = grid.copy()
+    for y in range(n):
+        for x in range(n):
+            L = lums[grid[y, x]]
+            md = 0.0
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < n and 0 <= nx < n:
+                    md = max(md, abs(L - lums[grid[ny, nx]]))
+            if md > threshold:
+                out[y, x] = dark
+    return out
+
+
 # ---------------------------------------------------------------- 绘图
 def draw_preview(grid, palette, cell, labels=False):
     """圆角豆粒风格预览图，接近成品观感。labels=True 时给每颗豆标注色号。"""
@@ -194,7 +237,8 @@ def draw_spec(grid, palette, counts):
 
 
 # ---------------------------------------------------------------- 主流程
-def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, labels=False, preset='通用'):
+def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, labels=False, preset='通用',
+            clean=False, outline=False, outline_threshold=45):
     # 1. 读图 + 预设增强(裁剪+柔化/卡通化等) + 缩小
     img = Image.open(image_path).convert("RGB")
     steps = []
@@ -214,6 +258,15 @@ def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, label
     else:
         k = min(k, min(n * n, len(palette)))
         grid = quantize_kmeans(lab_img, pal_lab, k, seed)
+
+    # 3.5 像素级后处理
+    post_steps = []
+    if clean:
+        grid = clean_isolated(grid)
+        post_steps.append("去孤立杂点")
+    if outline:
+        grid = add_outline(grid, palette, outline_threshold)
+        post_steps.append(f"卡通描边(阈值{outline_threshold})")
 
     # 4. 统计与报告
     used = grid.ravel()
@@ -237,11 +290,15 @@ def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, label
 
     print(f"网格: {n}×{n} = {n * n} 颗豆  |  色板: {brand}（{len(palette)} 色可用，实际用 {unique} 色）")
     print(f"预设: {preset}" + (f" ｜ 处理: {'；'.join(m for m, e in steps if not e)}" if steps else ""))
+    if post_steps:
+        print("后处理: " + "、".join(post_steps))
     if any(e for _, e in steps):
         print("[警告] " + "；".join(m for m, e in steps if e))
     print(f"量化方法: {method}{'(k=' + str(k) + ')' if method == 'kmeans' else ''}  |  平均每豆色差 ΔE = {avg_de:.1f}")
     print(f"输出: {out_prefix}_preview.png / _spec.png / _usage.csv")
-    if avg_de > 15:
+    if avg_de > 15 and outline:
+        print(f"[提示] avgΔE={avg_de:.1f} 因卡通描边而偏高（描边是艺术化改动），属正常现象。")
+    elif avg_de > 15:
         print(f"[警告] avgΔE={avg_de:.1f} 超过建议阈值 15，人像建议升一档网格（如 39→49）；简单图案可降档省豆。")
     else:
         print(f"[OK] avgΔE={avg_de:.1f} 在建议阈值 15 以内，此分辨率保真度可接受。")
@@ -262,6 +319,9 @@ def main():
     ap.add_argument("-o", "--out", default=None, help="输出前缀（默认=输入文件名）")
     ap.add_argument("-s", "--cell", type=int, default=16, help="预览图每格像素，默认 16")
     ap.add_argument("-L", "--labels", action="store_true", help="在预览图上标注色号")
+    ap.add_argument("--clean", action="store_true", help="去孤立杂点（清理量化噪点）")
+    ap.add_argument("--outline", action="store_true", help="卡通描边（沿明暗边界勾轮廓线，形成卡通感）")
+    ap.add_argument("--outline-threshold", type=int, default=45, help="描边阈值（明暗差 0-150），默认 45")
     ap.add_argument("--seed", type=int, default=42, help="随机种子，保证可复现")
     args = ap.parse_args()
 
@@ -279,7 +339,8 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         print(f"已创建输出目录: {out_dir}", file=sys.stderr)
     process(args.image, args.N, args.palette, args.method, args.k,
-            args.only, out_prefix, args.cell, args.seed, labels=args.labels, preset=args.preset)
+            args.only, out_prefix, args.cell, args.seed, labels=args.labels, preset=args.preset,
+            clean=args.clean, outline=args.outline, outline_threshold=args.outline_threshold)
 
 
 if __name__ == "__main__":

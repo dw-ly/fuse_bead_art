@@ -136,9 +136,59 @@
     return s / pixels.length;
   }
 
+  // ---------- 像素级后处理 ----------
+  function luminanceHex(hex) {
+    return 0.299 * parseInt(hex.slice(1, 3), 16) +
+           0.587 * parseInt(hex.slice(3, 5), 16) +
+           0.114 * parseInt(hex.slice(5, 7), 16);
+  }
+
+  // 去孤立杂点：周围 8 格没有同色（完全孤立）的格子，替换成邻域主色
+  function cleanIsolated(grid, N) {
+    var out = new Int32Array(grid);
+    for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) {
+      var i = y * N + x, c = grid[i];
+      var same = 0, total = 0, counts = {};
+      var y0 = Math.max(0, y - 1), y1 = Math.min(N - 1, y + 1);
+      var x0 = Math.max(0, x - 1), x1 = Math.min(N - 1, x + 1);
+      for (var yy = y0; yy <= y1; yy++) for (var xx = x0; xx <= x1; xx++) {
+        var j = yy * N + xx;
+        if (j === i) continue;
+        total++;
+        var cc = grid[j];
+        if (cc === c) same++;
+        counts[cc] = (counts[cc] || 0) + 1;
+      }
+      if (total >= 3 && same === 0) {
+        var best = c, bc = 0;
+        for (var kk in counts) { if (counts[kk] > bc) { bc = counts[kk]; best = +kk; } }
+        out[i] = best;
+      }
+    }
+    return out;
+  }
+
+  // 卡通描边：4 邻域明暗差超过阈值 → 涂成色板最深的颜色（形成轮廓线）
+  function addOutline(grid, N, colors, threshold) {
+    var lums = colors.map(function (c) { return luminanceHex(c[1]); });
+    var dark = 0, minL = Infinity;
+    lums.forEach(function (l, idx) { if (l < minL) { minL = l; dark = idx; } });
+    var out = new Int32Array(grid);
+    for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) {
+      var i = y * N + x, L = lums[grid[i]], md = 0;
+      if (y > 0) md = Math.max(md, Math.abs(L - lums[grid[(y - 1) * N + x]]));
+      if (y < N - 1) md = Math.max(md, Math.abs(L - lums[grid[(y + 1) * N + x]]));
+      if (x > 0) md = Math.max(md, Math.abs(L - lums[grid[y * N + x - 1]]));
+      if (x < N - 1) md = Math.max(md, Math.abs(L - lums[grid[y * N + x + 1]]));
+      if (md > threshold) out[i] = dark;
+    }
+    return out;
+  }
+
   // ---------- 主流程 ----------
   // data: 色板数据对象;  imageData: N*N 的 RGBA Uint8ClampedArray
-  function processImage(data, brand, only, imageData, N, method, k, seed) {
+  // post: {clean:bool, outline:bool, outlineThreshold:int} 可选的像素级后处理
+  function processImage(data, brand, only, imageData, N, method, k, seed, post) {
     var colors = flattenPalette(data, brand, only);
     var P = N * N, pixels = new Array(P);
     for (var i = 0; i < P; i++) {
@@ -148,6 +198,8 @@
     var grid = method === 'nearest'
       ? quantizeNearest(pixels, palLabs)
       : quantizeKMeans(pixels, palLabs, Math.min(k, P, colors.length), mulberry32(seed));
+    if (post && post.clean) grid = cleanIsolated(grid, N);
+    if (post && post.outline) grid = addOutline(grid, N, colors, post.outlineThreshold || 45);
     var avgDE = avgDeltaE(pixels, palLabs, grid);
     var countMap = {};
     for (var i = 0; i < P; i++) {
@@ -168,6 +220,9 @@
     quantizeNearest: quantizeNearest,
     quantizeKMeans: quantizeKMeans,
     avgDeltaE: avgDeltaE,
+    luminanceHex: luminanceHex,
+    cleanIsolated: cleanIsolated,
+    addOutline: addOutline,
     processImage: processImage
   };
 });

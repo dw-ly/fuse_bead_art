@@ -111,6 +111,13 @@
       <input type="number" id="k-input" min="2" max="60" value="32">
     </label>
     <label class="chk"><input type="checkbox" id="label-check">预览图标注色号</label>
+
+    <h3>④ 后处理（像素级）</h3>
+    <label class="chk"><input type="checkbox" id="clean-check">去孤立杂点（清掉零散噪点）</label>
+    <label class="chk"><input type="checkbox" id="outline-check">卡通描边（勾勒轮廓线）</label>
+    <label class="row"><span>描边阈值（明暗差）</span>
+      <input type="number" id="outline-thresh" min="10" max="150" value="45">
+    </label>
     <button id="gen-btn">生成图纸</button>
   </div>
 

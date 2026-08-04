@@ -16,6 +16,9 @@
   var methodNearest = $('method-nearest');
   var kInput = $('k-input');
   var labelCheck = $('label-check');
+  var cleanCheck = $('clean-check');
+  var outlineCheck = $('outline-check');
+  var outlineThresh = $('outline-thresh');
   var genBtn = $('gen-btn');
   var previewCanvas = $('preview-canvas');
   var specCanvas = $('spec-canvas');
@@ -105,7 +108,8 @@
     });
     genBtn.addEventListener('click', generate);
     ['change', 'input'].forEach(function (ev) {
-      [gridSelect, gridCustom, brandSelect, presetSelect, subsetInput, methodKmeans, methodNearest, kInput, labelCheck]
+      [gridSelect, gridCustom, brandSelect, presetSelect, subsetInput, methodKmeans, methodNearest, kInput, labelCheck,
+       cleanCheck, outlineCheck, outlineThresh]
         .forEach(function (el) { el.addEventListener(ev, generate); });
     });
     // 下载
@@ -259,10 +263,21 @@
         rawRGBA = enhanced.imageData.data;
         steps = enhanced.steps;
       }
-      var res = window.BeadsCore.processImage(window.PALETTES, brand, only, rawRGBA, N, method, k, SEED);
+      var post = null;
+      if (cleanCheck.checked || outlineCheck.checked) {
+        post = {
+          clean: cleanCheck.checked,
+          outline: outlineCheck.checked,
+          outlineThreshold: parseInt(outlineThresh.value, 10) || 45
+        };
+      }
+      var res = window.BeadsCore.processImage(window.PALETTES, brand, only, rawRGBA, N, method, k, SEED, post);
+      var postSteps = [];
+      if (post && post.clean) postSteps.push('去杂点');
+      if (post && post.outline) postSteps.push('卡通描边');
       current = { grid: res.grid, counts: res.counts, colors: res.colors,
                   unique: res.unique, avgDE: res.avgDE, N: N, brand: brand,
-                  preset: preset, steps: steps };
+                  preset: preset, steps: steps, postSteps: postSteps };
       renderAll();
     } catch (e) {
       showStatus('出错：' + e.message, true);
@@ -285,14 +300,23 @@
     drawPreview(previewCanvas.getContext('2d'), previewCanvas, g);
     drawSpec(specCanvas.getContext('2d'), specCanvas, g);
     // 指标
-    var warn = g.avgDE > 15;
+    var outlined = g.postSteps && g.postSteps.indexOf('卡通描边') >= 0;
+    var warn = g.avgDE > 15 && !outlined;
+    var verdict;
+    if (warn) {
+      verdict = '<span class="bad">(超过建议阈值 15，建议加大网格)</span>';
+    } else if (outlined && g.avgDE > 15) {
+      verdict = '<span class="good">(ΔE 含卡通描边艺术化改动，属正常)</span>';
+    } else {
+      verdict = '<span class="good">(达标，可接受)</span>';
+    }
     var presetInfo = g.preset && g.preset !== '通用'
       ? ' ｜ 预设 <b>' + g.preset + '</b>' + (g.steps && g.steps.length ? '（' + g.steps.join('、') + '）' : '')
       : '';
+    var postInfo = g.postSteps && g.postSteps.length ? ' ｜ 后处理 <b>' + g.postSteps.join('、') + '</b>' : '';
     metricsEl.innerHTML = '网格 <b>' + g.N + '×' + g.N + '</b> = <b>' + (g.N * g.N) +
       '</b> 颗豆 ｜ 用色 <b>' + g.unique + '</b> 种 ｜ 平均色差 ΔE = <b>' + g.avgDE.toFixed(1) + '</b> ' +
-      (warn ? '<span class="bad">(超过建议阈值 15，建议加大网格)</span>'
-            : '<span class="good">(达标，可接受)</span>') + presetInfo;
+      verdict + presetInfo + postInfo;
     // 用量表
     usageTableBody.innerHTML = '';
     g.counts.forEach(function (c) {
