@@ -15,7 +15,10 @@ pip install -r requirements.txt
 python scripts/photo2beads.py 照片.jpg -N 60              # 默认 MARD 291 色板 + kmeans 主色聚类
 python scripts/photo2beads.py 照片.jpg -N 49 -p hama -m nearest -L
 python scripts/photo2beads.py 照片.jpg -N 60 --preset 花   # 按照片主题自动增强
+python scripts/photo2beads.py 照片.jpg -N 80 --max-grid 100 # 细节密集的小图放宽网格上限
 ```
+
+网格上限默认 60（`--max-grid` 可调到 100）：小尺寸/细节密集的图在 60×60 下眼鼻等特征会碎成噪点，需更高分辨率才能干净分离。
 
 **主题预设**（`--preset`，按主体自动优化）：
 

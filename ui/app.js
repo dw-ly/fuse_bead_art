@@ -9,6 +9,7 @@
   var gridSelect = $('grid-select');
   var gridCustomWrap = $('grid-custom-wrap');
   var gridCustom = $('grid-custom');
+  var maxGridInput = $('max-grid');
   var brandSelect = $('brand-select');
   var presetSelect = $('preset-select');
   var subsetInput = $('subset-input');
@@ -34,9 +35,10 @@
   var downloadZip = $('download-zip');
 
   var SEED = 42;
-  var MAX_GRID = 60;
+  var MAX_GRID_HARD = 100;
   var currentFile = null;   // 当前上传的文件（点击选择 / 拖拽 都记录到这里）
   var current = null;       // 最近一次结果 {grid, counts, colors, unique, avgDE, N}
+  var lastClamped = false;  // 本次网格是否被上限钳制
   var fileName = '';
 
   // 把任何运行期错误显示到页面上，避免"点了没反应"
@@ -108,7 +110,7 @@
     });
     genBtn.addEventListener('click', generate);
     ['change', 'input'].forEach(function (ev) {
-      [gridSelect, gridCustom, brandSelect, presetSelect, subsetInput, methodKmeans, methodNearest, kInput, labelCheck,
+      [gridSelect, gridCustom, maxGridInput, brandSelect, presetSelect, subsetInput, methodKmeans, methodNearest, kInput, labelCheck,
        cleanCheck, outlineCheck, outlineThresh]
         .forEach(function (el) { el.addEventListener(ev, generate); });
     });
@@ -290,7 +292,16 @@
     var v = gridSelect.value;
     var n = v === 'custom' ? parseInt(gridCustom.value, 10) : parseInt(v, 10);
     if (!n || n < 1) n = 60;
-    if (n > MAX_GRID) n = MAX_GRID;
+    // 上限可配置（默认 60，细节密集的小图可上调到 100）
+    var maxGrid = parseInt(maxGridInput.value, 10) || 60;
+    if (maxGrid < 10) maxGrid = 10;
+    if (maxGrid > MAX_GRID_HARD) maxGrid = MAX_GRID_HARD;
+    if (n > maxGrid) {
+      lastClamped = true;
+      n = maxGrid;
+    } else {
+      lastClamped = false;
+    }
     return n;
   }
 
@@ -314,9 +325,10 @@
       ? ' ｜ 预设 <b>' + g.preset + '</b>' + (g.steps && g.steps.length ? '（' + g.steps.join('、') + '）' : '')
       : '';
     var postInfo = g.postSteps && g.postSteps.length ? ' ｜ 后处理 <b>' + g.postSteps.join('、') + '</b>' : '';
+    var clampInfo = lastClamped ? ' <span class="bad">(已达上限 ' + (parseInt(maxGridInput.value, 10) || 60) + '，可在"网格上限"里调高)</span>' : '';
     metricsEl.innerHTML = '网格 <b>' + g.N + '×' + g.N + '</b> = <b>' + (g.N * g.N) +
       '</b> 颗豆 ｜ 用色 <b>' + g.unique + '</b> 种 ｜ 平均色差 ΔE = <b>' + g.avgDE.toFixed(1) + '</b> ' +
-      verdict + presetInfo + postInfo;
+      verdict + presetInfo + postInfo + clampInfo;
     // 用量表
     usageTableBody.innerHTML = '';
     g.counts.forEach(function (c) {

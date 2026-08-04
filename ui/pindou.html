@@ -91,10 +91,15 @@
           <option value="39">39×39（1521豆）</option>
           <option value="49">49×49（2401豆）</option>
           <option value="60" selected>60×60（3600豆）</option>
+          <option value="80">80×80（6400豆）</option>
+          <option value="100">100×100（10000豆）</option>
           <option value="custom">自定义…</option>
         </select>
-        <span id="grid-custom-wrap"><input type="number" id="grid-custom" min="1" max="60" value="60"></span>
+        <span id="grid-custom-wrap"><input type="number" id="grid-custom" min="1" max="100" value="60"></span>
       </span>
+    </label>
+    <label class="row"><span>网格上限</span>
+      <input type="number" id="max-grid" min="10" max="100" value="60" title="细节密集的小图（如小尺寸插画）可上调到 100 才能干净分离眼鼻等特征">
     </label>
     <label class="row"><span>色板品牌</span>
       <select id="brand-select"></select>

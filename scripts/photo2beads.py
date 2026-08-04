@@ -30,7 +30,7 @@ from enhance import PRESETS, apply_preset
 
 # 色号库路径（项目数据资产，由 parse_palette.py 生成）
 PALETTE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "bead_palettes.json")
-MAX_GRID = 60  # 本项目按 60×60 以内做
+MAX_GRID_HARD = 100  # 网格物理上限（细节密集的小图需 80-100 才能干净分离特征）
 
 BRANDS = ["mard291", "mard221", "artkal", "perler", "hama", "artkalMini"]
 
@@ -310,7 +310,9 @@ def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, label
 def main():
     ap = argparse.ArgumentParser(description="照片 → 拼豆图纸（M1 原型）")
     ap.add_argument("image", help="输入照片路径")
-    ap.add_argument("-N", type=int, default=49, help=f"网格边长(豆数)，上限 {MAX_GRID}，默认 49")
+    ap.add_argument("-N", type=int, default=49, help=f"网格边长(豆数)，物理上限 {MAX_GRID_HARD}，默认 49")
+    ap.add_argument("--max-grid", type=int, default=60,
+                    help=f"网格上限（默认 60，细节密集的小图可调到 {MAX_GRID_HARD}），-N 超过上限会被钳制")
     ap.add_argument("-p", "--palette", default="mard291", choices=BRANDS, help="色板品牌，默认 mard291")
     ap.add_argument("-m", "--method", default="kmeans", choices=["nearest", "kmeans"],
                     help="量化方法：nearest=直接最近色；kmeans=主色聚类(照片推荐，默认)")
@@ -327,9 +329,10 @@ def main():
     ap.add_argument("--seed", type=int, default=42, help="随机种子，保证可复现")
     args = ap.parse_args()
 
-    if args.N > MAX_GRID:
-        print(f"⚠ 请求 {args.N}×{args.N} 超过上限 {MAX_GRID}，已按 {MAX_GRID} 处理。", file=sys.stderr)
-        args.N = MAX_GRID
+    max_grid = min(args.max_grid, MAX_GRID_HARD)
+    if args.N > max_grid:
+        print(f"⚠ 请求 {args.N}×{args.N} 超过上限 {max_grid}（可用 --max-grid 提高），已按 {max_grid} 处理。", file=sys.stderr)
+        args.N = max_grid
     if args.N < 1:
         print("⚠ 网格边长至少 1。", file=sys.stderr)
         sys.exit(1)
