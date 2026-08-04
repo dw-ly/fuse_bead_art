@@ -7,3 +7,13 @@ __pycache__/
 
 # 示例产物（用户个人照片 + 可由工具再生成的输出）
 examples/
+
+# PyInstaller 构建产物
+dist/
+build/
+*.spec
+
+# 运行时日志/测试临时文件
+pindou_error.log
+pindou_test_url.txt
+*.log

@@ -6,6 +6,8 @@
 
 **浏览器 UI（推荐，无需安装）**：双击打开 `ui/pindou.html`，拖入照片 → 选主题预设 → 自动生成 → 一键下载 ZIP 素材包（预览图 + 施工图 + 用量清单）。
 
+**桌面 EXE（可选）**：双击 `dist/FuseBeadArt.exe` → 自动打开浏览器使用 UI，完成后点控制窗口【退出】关闭。重新打包见下方「打包成 EXE」。
+
 **Python CLI**：
 
 ```bash
@@ -51,6 +53,15 @@ ui/         浏览器 UI（纯 HTML/JS，零依赖，含手写 ZIP 打包）
 data/       色号库（6 品牌 1094 色，JSON）
 docs/       调研与实现方案文档
 ```
+
+## 打包成 EXE
+
+```bash
+pip install pyinstaller
+python -m PyInstaller --onefile --noconsole --name FuseBeadArt --add-data "ui;ui" run_app.py
+```
+
+生成 `dist/FuseBeadArt.exe`（约 10MB）。EXE 内嵌 `ui/`，启动时在本地起服务器并自动打开浏览器，全流程（传图→预设→图纸→下载 ZIP）均在浏览器完成，无需安装 Python。
 
 ## 技术细节
 
