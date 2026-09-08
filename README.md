@@ -16,6 +16,8 @@ python scripts/photo2beads.py 照片.jpg -N 60              # 默认 MARD 291 �
 python scripts/photo2beads.py 照片.jpg -N 49 -p hama -m nearest -L
 python scripts/photo2beads.py 照片.jpg -N 60 --preset 花   # 按照片主题自动增强
 python scripts/photo2beads.py 照片.jpg -N 80 --max-grid 100 # 细节密集的小图放宽网格上限
+python scripts/photo2beads.py 照片.jpg --suggest-grid --preset 人像   # 扫描推荐最小网格
+python scripts/photo2beads.py 照片.jpg --apply-suggest --preset 人像  # 用推荐 N 直接出图
 ```
 
 网格上限默认 60（`--max-grid` 可调到 100）：小尺寸/细节密集的图在 60×60 下眼鼻等特征会碎成噪点，需更高分辨率才能干净分离。
@@ -29,7 +31,7 @@ python scripts/photo2beads.py 照片.jpg -N 80 --max-grid 100 # 细节密集的�
 | `动物` | 背景柔化 + 适度增强 |
 | `风景` | 轻降噪 + 饱和提升（不柔化） |
 | `插画` | 轻锐化 + 提饱和（适合已扁平的图） |
-| `人像转插画` | 卡通化：压平 + 颜色分级 + 勾轮廓线 |
+| `人像转插画` | 卡通化：边缘保持 + LAB 色块 + 描边上色（默认开 outline） |
 | `通用` | 直接转换，不做增强 |
 
 ## 生成内容
@@ -45,7 +47,8 @@ python scripts/photo2beads.py 照片.jpg -N 80 --max-grid 100 # 细节密集的�
 - **CIELAB + ΔE76 色差量化**——不是 RGB 最近色，符合人眼感知
 - **6 个品牌共 1094 个真实色号**（MARD 291 / Artkal / Perler / Hama…），色号表可配置
 - 两种量化：**k-means 主色聚类**（照片推荐）/ **直接最近色**
-- **像素级后处理**：去孤立杂点、卡通描边（沿轮廓勾线，人物可生成卡通形象）
+- **自动网格建议**：扫描 29/39/49/59/60 的 avgΔE，按主体下限推荐最小可用 N（CLI `--suggest-grid` / UI「推荐网格」）
+- **像素级后处理**：去孤立杂点、卡通描边（沿轮廓勾线；人像转插画默认开启）
 - **色号子集筛选**：只用你实际拥有的豆子颜色（`--only A1,B2`）
 - 浏览器端**零后端**：图片不上传服务器，纯本地处理，可离线使用
 

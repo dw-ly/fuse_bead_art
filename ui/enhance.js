@@ -18,6 +18,12 @@
     '人像转插画': { blur: 0,    sat: 1.10, sharpen: 0,   denoise: 0, cartoon: true,  center: true }
   };
   var PRESET_ORDER = ['通用', '人像', '风景', '花', '动物', '插画', '人像转插画'];
+  var PRESET_GRID_FLOOR = {
+    '人像': 49, '人像转插画': 49, '动物': 39, '插画': 29,
+    '通用': 29, '花': 39, '风景': 59
+  };
+  var DEFAULT_GRID_CANDIDATES = [29, 39, 49, 59, 60];
+  var AVG_DE_THRESHOLD = 15;
 
   // ---------- 纯像素算法（node 可测） ----------
   function luminanceAt(rgba, i) {
@@ -110,17 +116,134 @@
     }
   }
 
-  // 卡通化：分级 + 勾边（就地操作，返回用到的阈值）
-  function cartoon(rgba, w, h) {
-    var edge = edgeMap(rgba, w, h);
-    // 自适应阈值：取边缘的第 92 百分位
-    var sorted = Array.prototype.slice.call(edge).sort(function (a, b) { return a - b; });
-    var thr = sorted[Math.floor(sorted.length * 0.92)] || 30;
-    posterize(rgba, 5);
-    for (var i = 0; i < w * h; i++) {
-      if (edge[i] > thr) { rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = 0; }
+  // 简易 RGB k-means 色块压平（无 OpenCV 时的 LAB 近似）
+  function kmeansFlatten(rgba, w, h, nColors, seed) {
+    var P = w * h;
+    var pixels = new Array(P);
+    for (var i = 0; i < P; i++) {
+      pixels[i] = [rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]];
     }
-    return thr;
+    // mulberry32
+    var a = seed | 0;
+    function rng() {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    }
+    var k = Math.max(2, Math.min(nColors, P));
+    var centers = [], chosen = {}, guard = 0;
+    while (centers.length < k && guard < 10000) {
+      guard++;
+      var idx = Math.floor(rng() * P);
+      if (!chosen[idx]) { chosen[idx] = true; centers.push(pixels[idx].slice()); }
+    }
+    var labels = new Int32Array(P);
+    for (var iter = 0; iter < 12; iter++) {
+      for (var i = 0; i < P; i++) {
+        var best = 0, bd = Infinity, p = pixels[i];
+        for (var j = 0; j < k; j++) {
+          var c = centers[j];
+          var d = (p[0] - c[0]) * (p[0] - c[0]) + (p[1] - c[1]) * (p[1] - c[1]) + (p[2] - c[2]) * (p[2] - c[2]);
+          if (d < bd) { bd = d; best = j; }
+        }
+        labels[i] = best;
+      }
+      var sums = [], cnts = new Int32Array(k);
+      for (var j = 0; j < k; j++) sums.push([0, 0, 0]);
+      for (var i = 0; i < P; i++) {
+        var l = labels[i], p = pixels[i];
+        sums[l][0] += p[0]; sums[l][1] += p[1]; sums[l][2] += p[2]; cnts[l]++;
+      }
+      var moved = 0;
+      for (var j = 0; j < k; j++) {
+        if (cnts[j] > 0) {
+          var nc = [sums[j][0] / cnts[j], sums[j][1] / cnts[j], sums[j][2] / cnts[j]];
+          if (Math.abs(nc[0] - centers[j][0]) + Math.abs(nc[1] - centers[j][1]) + Math.abs(nc[2] - centers[j][2]) > 0.5) moved++;
+          centers[j] = nc;
+        }
+      }
+      if (moved === 0) break;
+    }
+    for (var i = 0; i < P; i++) {
+      var c = centers[labels[i]];
+      rgba[i * 4] = Math.round(c[0]);
+      rgba[i * 4 + 1] = Math.round(c[1]);
+      rgba[i * 4 + 2] = Math.round(c[2]);
+    }
+  }
+
+  // 盒式平滑近似双边（多次小半径）
+  function multiBoxSmooth(rgba, w, h, passes) {
+    passes = passes || 2;
+    for (var p = 0; p < passes; p++) {
+      var src = new Uint8ClampedArray(rgba);
+      for (var y = 1; y < h - 1; y++) for (var x = 1; x < w - 1; x++) {
+        var i = (y * w + x) * 4;
+        for (var c = 0; c < 3; c++) {
+          var sum = 0, wt = 0;
+          var center = src[i + c];
+          for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) {
+            var j = ((y + dy) * w + (x + dx)) * 4 + c;
+            var d = Math.abs(src[j] - center);
+            var wgt = d < 40 ? 1 : (d < 80 ? 0.3 : 0.05); // 边缘保持近似
+            sum += src[j] * wgt; wt += wgt;
+          }
+          rgba[i + c] = Math.round(sum / wt);
+        }
+      }
+    }
+  }
+
+  function boostSaturation(rgba, factor) {
+    for (var i = 0; i < rgba.length; i += 4) {
+      var r = rgba[i] / 255, g = rgba[i + 1] / 255, b = rgba[i + 2] / 255;
+      var max = Math.max(r, g, b), min = Math.min(r, g, b);
+      var l = (max + min) / 2, d = max - min;
+      if (d < 1e-6) continue;
+      var s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      var ns = Math.min(1, s * factor);
+      if (Math.abs(ns - s) < 1e-6) continue;
+      // 简易：向均值拉开
+      var m = (r + g + b) / 3;
+      rgba[i]     = Math.max(0, Math.min(255, Math.round((m + (r - m) * (ns / (s || 1e-6))) * 255)));
+      rgba[i + 1] = Math.max(0, Math.min(255, Math.round((m + (g - m) * (ns / (s || 1e-6))) * 255)));
+      rgba[i + 2] = Math.max(0, Math.min(255, Math.round((m + (b - m) * (ns / (s || 1e-6))) * 255)));
+    }
+  }
+
+  // 卡通化：边缘保持平滑 → k-means 色块 → 描边上色（非 AND）→ 提饱和
+  // levels: 色块数；outlineStrength: 0 关闭，≥1 涂深色轮廓
+  function cartoon(rgba, w, h, levels, outlineStrength) {
+    levels = levels || 10;
+    if (outlineStrength === undefined) outlineStrength = 1;
+    multiBoxSmooth(rgba, w, h, 3);
+    kmeansFlatten(rgba, w, h, levels, 42);
+    if (outlineStrength > 0) {
+      var edge = edgeMap(rgba, w, h);
+      var sorted = Array.prototype.slice.call(edge).sort(function (a, b) { return a - b; });
+      var thr = sorted[Math.floor(sorted.length * 0.88)] || 30;
+      // 轻微膨胀：邻域也标边
+      var mark = new Uint8Array(w * h);
+      for (var i = 0; i < w * h; i++) if (edge[i] > thr) mark[i] = 1;
+      if (outlineStrength >= 1) {
+        var dil = new Uint8Array(mark);
+        for (var y = 1; y < h - 1; y++) for (var x = 1; x < w - 1; x++) {
+          var p = y * w + x;
+          if (mark[p]) {
+            dil[p - 1] = dil[p + 1] = dil[p - w] = dil[p + w] = 1;
+          }
+        }
+        mark = dil;
+      }
+      for (var i = 0; i < w * h; i++) {
+        if (mark[i]) {
+          rgba[i * 4] = 20; rgba[i * 4 + 1] = 18; rgba[i * 4 + 2] = 22;
+        }
+      }
+    }
+    boostSaturation(rgba, 1.15);
+    return 0;
   }
 
   // ---------- 浏览器编排（依赖 canvas） ----------
@@ -165,8 +288,9 @@
     var data = wctx.getImageData(0, 0, workingSize, workingSize);
 
     if (cfg.cartoon) {
-      cartoon(data.data, workingSize, workingSize);
-      steps.push('卡通化');
+      cartoon(data.data, workingSize, workingSize, 10, 1);
+      wctx.putImageData(data, 0, 0);
+      steps.push('卡通化（k-means色块+描边上色）');
     } else {
       if (cfg.blur > 0) {
         // 边缘遮罩 → 模糊层带 alpha 叠加
@@ -232,12 +356,16 @@
   return {
     ENHANCE_PRESETS: ENHANCE_PRESETS,
     PRESET_ORDER: PRESET_ORDER,
+    PRESET_GRID_FLOOR: PRESET_GRID_FLOOR,
+    DEFAULT_GRID_CANDIDATES: DEFAULT_GRID_CANDIDATES,
+    AVG_DE_THRESHOLD: AVG_DE_THRESHOLD,
     edgeMap: edgeMap,
     saliencyCenter: saliencyCenter,
     boxBlur: boxBlur,
     posterize: posterize,
     unsharp: unsharp,
     cartoon: cartoon,
+    kmeansFlatten: kmeansFlatten,
     processImageWithPreset: processImageWithPreset
   };
 });

@@ -90,6 +90,7 @@
           <option value="29">29×29（841豆）</option>
           <option value="39">39×39（1521豆）</option>
           <option value="49">49×49（2401豆）</option>
+          <option value="59">59×59（3481豆）</option>
           <option value="60" selected>60×60（3600豆）</option>
           <option value="80">80×80（6400豆）</option>
           <option value="100">100×100（10000豆）</option>
@@ -123,7 +124,9 @@
     <label class="row"><span>描边阈值（明暗差）</span>
       <input type="number" id="outline-thresh" min="10" max="150" value="45">
     </label>
+    <button id="suggest-btn" type="button" style="width:100%;margin-top:10px;padding:9px;border:1px solid #ff5e62;border-radius:8px;background:#fff;color:#d64;font-size:14px;font-weight:600;cursor:pointer;">推荐网格</button>
     <button id="gen-btn">生成图纸</button>
+    <div class="hint">「推荐网格」扫描 29/39/49/59/60 的 avgΔE，选最小可用 N。</div>
   </div>
 
   <div class="main">

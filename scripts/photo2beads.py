@@ -10,6 +10,8 @@ photo2beads.py — 照片 → 拼豆图纸（M1 原型）
 用法示例：
     python scripts/photo2beads.py 照片.jpg -N 49                 # 默认: MARD 291 色板, k-means 主色
     python scripts/photo2beads.py 照片.jpg -N 39 -p hama -m nearest
+    python scripts/photo2beads.py 照片.jpg --suggest-grid --preset 人像   # 扫描推荐最小网格
+    python scripts/photo2beads.py 照片.jpg --apply-suggest --preset 人像  # 用推荐 N 出图
     python scripts/photo2beads.py 照片.jpg -N 49 -k 20 --only A1,B2,F3 -o 我的图纸
 
 生成文件（默认以输入文件名为前缀）：
@@ -26,7 +28,7 @@ import sys
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from enhance import PRESETS, apply_preset
+from enhance import PRESETS, PRESET_GRID_FLOOR, apply_preset
 
 # 色号库路径（项目数据资产，由 parse_palette.py 生成）
 PALETTE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "bead_palettes.json")
@@ -238,15 +240,107 @@ def draw_spec(grid, palette, counts):
     return img
 
 
+
+# ---------------------------------------------------------------- 网格建议 / 缩小
+DEFAULT_GRID_CANDIDATES = [29, 39, 49, 59, 60]
+AVG_DE_THRESHOLD = 15.0
+
+
+def resize_for_beads(img, n):
+    """缩小到 n×n：大图用 BOX/AREA（面积平均，抗混叠）；放大或等大用 LANCZOS。
+
+    照片路径缩小时 BOX 比 LANCZOS 更能代表局部均值，减少抽样噪点；
+    放大仍用 LANCZOS 保边缘。
+    """
+    w, h = img.size
+    if n < min(w, h):
+        # Pillow 10+ 有 Image.Resampling.BOX；旧版 Image.BOX
+        box = getattr(Image, "BOX", None) or getattr(getattr(Image, "Resampling", None), "BOX", Image.LANCZOS)
+        return img.resize((n, n), box)
+    return img.resize((n, n), Image.LANCZOS)
+
+
+def evaluate_grid(img_enhanced, n, palette, pal_lab, method, k, seed):
+    """对已增强方形图评估某一 N：量化后返回 avgΔE / unique / beads。"""
+    small = resize_for_beads(img_enhanced, n)
+    rgb = np.asarray(small)
+    lab_img = srgb_to_lab(rgb)
+    if method == "nearest":
+        grid = quantize_nearest(lab_img, pal_lab)
+    else:
+        kk = min(k, min(n * n, len(palette)))
+        grid = quantize_kmeans(lab_img, pal_lab, kk, seed)
+    avg_de = float(delta_e76(lab_img, pal_lab[grid]).mean())
+    unique = int(len(np.unique(grid)))
+    return {
+        "N": n,
+        "beads": n * n,
+        "avg_de": avg_de,
+        "unique": unique,
+        "pass": avg_de <= AVG_DE_THRESHOLD,
+    }
+
+
+def suggest_grid(image_path, brand, method, k, only, seed, preset, max_grid,
+                 candidates=None, cartoon_levels=10):
+    """扫描候选网格，返回 (rows, recommended_N, floor)。
+
+    推荐规则：最小 N ≥ 主体下限 且 avgΔE ≤ 15；若无一通过则取下限以上 ΔE 最低者。
+    """
+    if candidates is None:
+        candidates = DEFAULT_GRID_CANDIDATES
+    max_grid = min(max_grid, MAX_GRID_HARD)
+    cands = sorted({n for n in candidates if 1 <= n <= max_grid})
+    if not cands:
+        cands = [min(49, max_grid)]
+
+    floor = PRESET_GRID_FLOOR.get(preset, 29)
+    floor = min(floor, max_grid)
+
+    img = Image.open(image_path).convert("RGB")
+    img = apply_preset(img, preset, cartoon_levels=cartoon_levels)
+    palette = load_palette(brand, only)
+    pal_rgb = np.array([list(bytes.fromhex(c[1][1:])) for c in palette], dtype=np.uint8)
+    pal_lab = srgb_to_lab(pal_rgb)
+
+    rows = [evaluate_grid(img, n, palette, pal_lab, method, k, seed) for n in cands]
+
+    eligible = [r for r in rows if r["N"] >= floor and r["pass"]]
+    if eligible:
+        recommended = min(eligible, key=lambda r: r["N"])["N"]
+    else:
+        above = [r for r in rows if r["N"] >= floor] or rows
+        recommended = min(above, key=lambda r: (r["avg_de"], r["N"]))["N"]
+    return rows, recommended, floor
+
+
+def print_suggest_table(rows, recommended, floor, preset):
+    print(f"主体下限 floor={floor}（预设「{preset}」）｜阈值 avgΔE ≤ {AVG_DE_THRESHOLD}")
+    print(f"{'N':>4}  {'豆量':>6}  {'用色':>4}  {'avgΔE':>7}  判定")
+    print("-" * 40)
+    for r in rows:
+        mark = "✓" if r["pass"] else "·"
+        star = " ←推荐" if r["N"] == recommended else ""
+        floor_tag = " [≥floor]" if r["N"] >= floor else ""
+        print(f"{r['N']:>4}  {r['beads']:>6}  {r['unique']:>4}  {r['avg_de']:>7.1f}  {mark}{floor_tag}{star}")
+    print(f"推荐网格: {recommended}×{recommended}")
+    return recommended
+
+
 # ---------------------------------------------------------------- 主流程
 def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, labels=False, preset='通用',
-            clean=False, outline=False, outline_threshold=45):
+            clean=False, outline=False, outline_threshold=45, cartoon_levels=10):
     # 1. 读图 + 预设增强(裁剪+柔化/卡通化等) + 缩小
     img = Image.open(image_path).convert("RGB")
     steps = []
-    img = apply_preset(img, preset, log=lambda m, is_err=False: steps.append((m, is_err)))
-    img = img.resize((n, n), Image.LANCZOS)
+    img = apply_preset(img, preset, log=lambda m, is_err=False: steps.append((m, is_err)),
+                       cartoon_levels=cartoon_levels)
+    img = resize_for_beads(img, n)
     rgb = np.asarray(img)  # (n, n, 3) uint8
+
+    # 人像转插画：默认建议开启像素级描边（可被显式 --outline/--no-outline 覆盖）
+    if outline is None:
+        outline = (preset == '人像转插画')
 
     # 2. 色板
     palette = load_palette(brand, only)
@@ -324,8 +418,15 @@ def main():
     ap.add_argument("-s", "--cell", type=int, default=16, help="预览图每格像素，默认 16")
     ap.add_argument("-L", "--labels", action="store_true", help="在预览图上标注色号")
     ap.add_argument("--clean", action="store_true", help="去孤立杂点（清理量化噪点）")
-    ap.add_argument("--outline", action="store_true", help="卡通描边（沿明暗边界勾轮廓线，形成卡通感）")
+    ap.add_argument("--outline", action="store_true", default=None,
+                    help="卡通描边（沿明暗边界勾轮廓线）；人像转插画默认开启")
+    ap.add_argument("--no-outline", action="store_true", help="强制关闭卡通描边")
     ap.add_argument("--outline-threshold", type=int, default=45, help="描边阈值（明暗差 0-150），默认 45")
+    ap.add_argument("--cartoon-levels", type=int, default=10, help="卡通色块数（LAB k-means），默认 10")
+    ap.add_argument("--suggest-grid", action="store_true",
+                    help="扫描候选网格并打印 avgΔE 对比表与推荐 N（不出图）")
+    ap.add_argument("--apply-suggest", action="store_true",
+                    help="先扫描推荐网格，再用推荐 N 跑完整流程")
     ap.add_argument("--seed", type=int, default=42, help="随机种子，保证可复现")
     args = ap.parse_args()
 
@@ -337,15 +438,27 @@ def main():
         print("⚠ 网格边长至少 1。", file=sys.stderr)
         sys.exit(1)
 
+    outline = False if args.no_outline else (True if args.outline else None)
+
+    if args.suggest_grid or args.apply_suggest:
+        rows, recommended, floor = suggest_grid(
+            args.image, args.palette, args.method, args.k, args.only, args.seed,
+            args.preset, max_grid, cartoon_levels=args.cartoon_levels)
+        print_suggest_table(rows, recommended, floor, args.preset)
+        if args.suggest_grid and not args.apply_suggest:
+            return
+        args.N = recommended
+        print(f"应用推荐网格 N={args.N}", file=sys.stderr)
+
     out_prefix = args.out or os.path.splitext(args.image)[0]
-    # 自动创建输出目录（后续按"主题/照片名"分文件夹存放）
     out_dir = os.path.dirname(out_prefix)
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
         print(f"已创建输出目录: {out_dir}", file=sys.stderr)
     process(args.image, args.N, args.palette, args.method, args.k,
             args.only, out_prefix, args.cell, args.seed, labels=args.labels, preset=args.preset,
-            clean=args.clean, outline=args.outline, outline_threshold=args.outline_threshold)
+            clean=args.clean, outline=outline, outline_threshold=args.outline_threshold,
+            cartoon_levels=args.cartoon_levels)
 
 
 if __name__ == "__main__":

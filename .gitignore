@@ -17,3 +17,6 @@ build/
 pindou_error.log
 pindou_test_url.txt
 *.log
+
+# 本地虚拟环境
+.venv/

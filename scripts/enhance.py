@@ -34,6 +34,17 @@ PRESETS = {
 }
 PRESET_ORDER = ['通用', '人像', '风景', '花', '动物', '插画', '人像转插画']
 
+# 主体类型 → 最小网格下限（docs §4.1）
+PRESET_GRID_FLOOR = {
+    '人像': 49,
+    '人像转插画': 49,
+    '动物': 39,
+    '插画': 29,
+    '通用': 29,
+    '花': 39,
+    '风景': 59,
+}
+
 
 def _cascade_path():
     """人脸级联路径：优先项目内 data/models，其次 OpenCV 自带。"""
@@ -69,7 +80,6 @@ def detect_face(img):
         arr = np.asarray(img)
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
         min_size = max(40, min(img.size) // 100)
-        # scaleFactor=1.05：尺度步长更细，避免漏检（1.1 会跳过部分人脸尺度）
         faces = cascade.detectMultiScale(gray, 1.05, 3, minSize=(min_size, min_size))
         good = [(x, y, w, h) for (x, y, w, h) in faces if _is_skin_like(arr[y:y + h, x:x + w])]
         if not good:
@@ -111,7 +121,6 @@ def crop_square(img, face=None, center_on_subject=True):
     if face is not None and face[2] / min_dim >= 0.08:
         fx, fy, fs = face
         cx, cy = _edge_centroid(img)
-        # 一致性校验：脸与主体质心相距过远 → 疑似误检，回退主体质心裁方
         if abs(fx - cx) <= 0.15 * min_dim and abs(fy - cy) <= 0.25 * min_dim:
             f = fs / min_dim
             if f >= 0.2:
@@ -126,7 +135,6 @@ def crop_square(img, face=None, center_on_subject=True):
             top = int(max(0, min(fy - side / 2, h - side)))
             return img.crop((left, top, left + side, top + side)), True
 
-    # 主体质心居中（或纯居中）
     cx, cy = _edge_centroid(img) if center_on_subject else (w / 2, h / 2)
     side = min_dim
     left = int(max(0, min(cx - side / 2, w - side)))
@@ -157,7 +165,6 @@ def adjust_saturation(img, factor):
         return img
     arr = np.asarray(img).astype(np.uint8)
     hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-    # S 通道在 uint8 [0,255] 域乘系数（float 运算后截回）
     s = np.clip(hsv[..., 1].astype(np.float32) * factor, 0, 255).astype(np.uint8)
     hsv[..., 1] = s
     return Image.fromarray(cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB))
@@ -183,28 +190,89 @@ def sharpen(img, amount):
     return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 
-def cartoon(img, levels=5):
-    """卡通化（人像转插画）：双边压平 → 颜色分级 → 勾深色轮廓线。"""
-    arr = np.asarray(img)
-    # 1. 强双边压平：皮肤/纹理变平涂
-    flat = cv2.bilateralFilter(arr, 9, 60, 60)
-    flat = cv2.bilateralFilter(flat, 9, 60, 60)
-    # 2. 颜色分级：每个通道压缩成 levels 级 → 动漫平涂色块（用 int32 防 uint8 溢出）
-    q = max(1, 256 // levels)
-    flat = ((flat.astype(np.int32) // q) * q + q // 2)
-    flat = np.clip(flat, 0, 255).astype(np.uint8)
-    # 3. 勾边：自适应阈值提取轮廓，压成黑色线条
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    gray_blur = cv2.medianBlur(gray, 5)
-    edges = cv2.adaptiveThreshold(gray_blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                  cv2.THRESH_BINARY, 9, 10)
-    outline = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
-    result = cv2.bitwise_and(flat, outline)
-    return Image.fromarray(result)
+def _lab_kmeans_flatten(arr, n_colors, seed=42):
+    """在 LAB 空间 k-means 压成 n_colors 色块，返回 RGB uint8。"""
+    h, w = arr.shape[:2]
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).astype(np.float32)
+    flat = lab.reshape(-1, 3)
+    # 子采样加速（最多 8k 点）
+    rng = np.random.default_rng(seed)
+    n = flat.shape[0]
+    sample_n = min(n, 8000)
+    sample = flat[rng.choice(n, sample_n, replace=False)]
+    # 简易 k-means
+    k = max(2, min(n_colors, sample_n))
+    centers = sample[rng.choice(sample_n, k, replace=False)].copy()
+    for _ in range(20):
+        d = np.sum((sample[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
+        labels = d.argmin(axis=-1)
+        new_c = centers.copy()
+        for i in range(k):
+            m = labels == i
+            if m.any():
+                new_c[i] = sample[m].mean(axis=0)
+        if np.allclose(new_c, centers, atol=0.5):
+            centers = new_c
+            break
+        centers = new_c
+    d_all = np.sum((flat[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
+    assigned = centers[d_all.argmin(axis=-1)].reshape(h, w, 3)
+    out_lab = np.clip(assigned, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(out_lab, cv2.COLOR_LAB2RGB)
+
+
+def cartoon(img, levels=10, outline_strength=1.0):
+    """卡通化（人像转插画）：边缘保持压平 → LAB k-means 色块 → 描边上色 → 提饱和。
+
+    与旧版差异：不用 per-channel posterize；不用 bitwise_and（会挖空），
+    改为在扁平图上把边缘像素涂成深色轮廓。
+
+    levels: 色块数（约 8–12）
+    outline_strength: 0 关闭描边；1 默认；越大膨胀越多 / 线越粗
+    """
+    arr = np.asarray(img).astype(np.uint8)
+    # 1. 边缘保持压平
+    if hasattr(cv2, 'edgePreservingFilter'):
+        flat = cv2.edgePreservingFilter(arr, flags=1, sigma_s=60, sigma_r=0.4)
+        if hasattr(cv2, 'stylization') and outline_strength > 0:
+            # 轻 stylization 再混回，避免过度油画感
+            sty = cv2.stylization(flat, sigma_s=40, sigma_r=0.3)
+            flat = cv2.addWeighted(flat, 0.7, sty, 0.3, 0)
+    else:
+        flat = arr
+        for _ in range(3):
+            flat = cv2.bilateralFilter(flat, 9, 75, 75)
+
+    # 2. LAB / RGB k-means 色块（非通道 posterize）
+    flat = _lab_kmeans_flatten(flat, n_colors=levels)
+
+    # 3. 轮廓：在扁平灰图上检测，轻微膨胀，涂深色（不 bitwise_and）
+    if outline_strength > 0:
+        gray = cv2.cvtColor(flat, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 40, 120)
+        if edges.sum() < gray.size * 0.005:
+            # Canny 太稀时回退自适应阈值
+            blur = cv2.medianBlur(gray, 5)
+            edges = 255 - cv2.adaptiveThreshold(
+                blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 9, 8)
+        k = max(1, int(round(outline_strength)))
+        if k > 0:
+            kernel = np.ones((k, k), np.uint8)
+            edges = cv2.dilate(edges, kernel, iterations=1)
+        # 深色轮廓（近黑，略留一点色以免死黑死板）
+        dark = np.array([20, 18, 22], dtype=np.uint8)
+        mask = edges > 0
+        flat = flat.copy()
+        flat[mask] = dark
+
+    # 4. 轻微提饱和（拼豆成品更鲜）
+    out = Image.fromarray(flat)
+    out = adjust_saturation(out, 1.15)
+    return out
 
 
 # ---------------------------------------------------------------- 主入口
-def apply_preset(img, preset, log=None):
+def apply_preset(img, preset, log=None, cartoon_levels=10, cartoon_outline=1.0):
     """按预设处理图片，返回处理后的方形图（已裁剪+增强）。"""
     if preset not in PRESETS:
         preset = '通用'
@@ -226,8 +294,8 @@ def apply_preset(img, preset, log=None):
             log('人脸检测：未采用人脸（不存在或置信度不足/与主体不一致），按主体质心定位')
 
     if cfg['cartoon']:
-        log(f'卡通化处理（{preset}）')
-        return cartoon(img)
+        log(f'卡通化处理（{preset}，levels={cartoon_levels}）')
+        return cartoon(img, levels=cartoon_levels, outline_strength=cartoon_outline)
 
     steps = []
     if cfg['blur'] > 0:

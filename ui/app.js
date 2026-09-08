@@ -21,6 +21,7 @@
   var outlineCheck = $('outline-check');
   var outlineThresh = $('outline-thresh');
   var genBtn = $('gen-btn');
+  var suggestBtn = $('suggest-btn');
   var previewCanvas = $('preview-canvas');
   var specCanvas = $('spec-canvas');
   var metricsEl = $('metrics');
@@ -109,6 +110,11 @@
       if (f) handleFile(f);
     });
     genBtn.addEventListener('click', generate);
+    if (suggestBtn) suggestBtn.addEventListener('click', suggestGrid);
+    // 人像转插画：默认勾选卡通描边
+    presetSelect.addEventListener('change', function () {
+      if (presetSelect.value === '人像转插画') outlineCheck.checked = true;
+    });
     ['change', 'input'].forEach(function (ev) {
       [gridSelect, gridCustom, maxGridInput, brandSelect, presetSelect, subsetInput, methodKmeans, methodNearest, kInput, labelCheck,
        cleanCheck, outlineCheck, outlineThresh]
@@ -240,6 +246,98 @@
     });
   }
 
+
+  function maxGridValue() {
+    var maxGrid = parseInt(maxGridInput.value, 10) || 60;
+    if (maxGrid < 10) maxGrid = 10;
+    if (maxGrid > MAX_GRID_HARD) maxGrid = MAX_GRID_HARD;
+    return maxGrid;
+  }
+
+  function setGridSelect(n) {
+    var opt = Array.prototype.find.call(gridSelect.options, function (o) { return o.value === String(n); });
+    if (opt) {
+      gridSelect.value = String(n);
+      gridCustomWrap.style.display = 'none';
+    } else {
+      gridSelect.value = 'custom';
+      gridCustomWrap.style.display = 'inline-block';
+      gridCustom.value = String(n);
+    }
+  }
+
+  // ---- 推荐网格：轻量扫描候选 N ----
+  async function suggestGrid() {
+    if (!currentFile) {
+      showStatus('请先上传照片，再点「推荐网格」。', true);
+      return;
+    }
+    if (suggestBtn) { suggestBtn.disabled = true; suggestBtn.textContent = '扫描中…'; }
+    genBtn.disabled = true;
+    showStatus('正在扫描候选网格…');
+    try {
+      var brand = brandSelect.value;
+      var only = subsetInput.value.trim() || null;
+      var method = methodNearest.checked ? 'nearest' : 'kmeans';
+      var k = parseInt(kInput.value, 10) || 16;
+      var preset = presetSelect.value;
+      var maxG = maxGridValue();
+      var cands = (window.BeadsEnhance.DEFAULT_GRID_CANDIDATES || [29, 39, 49, 59, 60])
+        .filter(function (n) { return n <= maxG; });
+      if (!cands.length) cands = [Math.min(49, maxG)];
+      var floor = (window.BeadsEnhance.PRESET_GRID_FLOOR || {})[preset] || 29;
+      floor = Math.min(floor, maxG);
+      var thr = window.BeadsEnhance.AVG_DE_THRESHOLD || 15;
+
+      var img = await loadImage(currentFile);
+      var rows = [];
+      for (var ci = 0; ci < cands.length; ci++) {
+        var N = cands[ci];
+        var rawRGBA, steps = [];
+        if (preset === '通用') {
+          rawRGBA = await readImageData(currentFile, N);
+        } else {
+          var enhanced = window.BeadsEnhance.processImageWithPreset(img, preset, N, 512);
+          rawRGBA = enhanced.imageData.data;
+          steps = enhanced.steps;
+        }
+        var res = window.BeadsCore.processImage(window.PALETTES, brand, only, rawRGBA, N, method, k, SEED, null);
+        rows.push({ N: N, beads: N * N, unique: res.unique, avgDE: res.avgDE, pass: res.avgDE <= thr });
+      }
+      var eligible = rows.filter(function (r) { return r.N >= floor && r.pass; });
+      var recommended;
+      if (eligible.length) {
+        recommended = eligible.reduce(function (a, b) { return a.N < b.N ? a : b; }).N;
+      } else {
+        var above = rows.filter(function (r) { return r.N >= floor; });
+        if (!above.length) above = rows;
+        recommended = above.reduce(function (a, b) {
+          return (a.avgDE < b.avgDE || (a.avgDE === b.avgDE && a.N < b.N)) ? a : b;
+        }).N;
+      }
+      setGridSelect(recommended);
+      // 展示对比表
+      var html = '推荐 <b>' + recommended + '×' + recommended + '</b>（预设「' + preset + '」下限 ' + floor +
+        '，阈值 ΔE≤' + thr + '）<br><table style="margin-top:8px;font-size:12px"><thead><tr>' +
+        '<th>N</th><th>豆量</th><th>用色</th><th>avgΔE</th><th></th></tr></thead><tbody>';
+      rows.forEach(function (r) {
+        var star = r.N === recommended ? ' ←推荐' : '';
+        var ok = r.pass ? '<span class="good">✓</span>' : '·';
+        html += '<tr' + (r.N === recommended ? ' style="background:#fff5f4"' : '') + '><td>' + r.N +
+          '</td><td>' + r.beads + '</td><td>' + r.unique + '</td><td>' + r.avgDE.toFixed(1) +
+          '</td><td>' + ok + star + '</td></tr>';
+      });
+      html += '</tbody></table>';
+      metricsEl.innerHTML = html;
+      // 用推荐 N 正式生成
+      await generate();
+    } catch (e) {
+      showStatus('推荐失败：' + e.message, true);
+    }
+    if (suggestBtn) { suggestBtn.disabled = false; suggestBtn.textContent = '推荐网格'; }
+    genBtn.disabled = false;
+  }
+
   // ---- 主流程 ----
   async function generate() {
     if (!currentFile) {
@@ -264,6 +362,9 @@
         var enhanced = window.BeadsEnhance.processImageWithPreset(img, preset, N, 512);
         rawRGBA = enhanced.imageData.data;
         steps = enhanced.steps;
+      }
+      if (preset === '人像转插画' && !outlineCheck.dataset.userUnset) {
+        outlineCheck.checked = true;
       }
       var post = null;
       if (cleanCheck.checked || outlineCheck.checked) {
