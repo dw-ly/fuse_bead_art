@@ -113,9 +113,16 @@
       <label><input type="radio" name="method" id="method-kmeans" checked>主色聚类（照片推荐）</label>
       <label><input type="radio" name="method" id="method-nearest">最近色</label>
     </div>
+    <label class="row"><span>色差</span>
+      <select id="delta-select">
+        <option value="e2000" selected>CIEDE2000（默认）</option>
+        <option value="e76">ΔE76</option>
+      </select>
+    </label>
     <label class="row"><span>主色数 k</span>
       <input type="number" id="k-input" min="2" max="60" value="32">
     </label>
+    <label class="chk"><input type="checkbox" id="matting-check">背景抠图（人像/花/动物推荐）</label>
     <label class="chk"><input type="checkbox" id="label-check">预览图标注色号</label>
 
     <h3>④ 后处理（像素级）</h3>
@@ -165,6 +172,7 @@
 <script src="core.js"></script>
 <script src="zip.js"></script>
 <script src="enhance.js"></script>
+<script src="matting.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

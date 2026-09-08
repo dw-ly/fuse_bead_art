@@ -15,6 +15,8 @@
   var subsetInput = $('subset-input');
   var methodKmeans = $('method-kmeans');
   var methodNearest = $('method-nearest');
+  var deltaSelect = $('delta-select');
+  var mattingCheck = $('matting-check');
   var kInput = $('k-input');
   var labelCheck = $('label-check');
   var cleanCheck = $('clean-check');
@@ -67,6 +69,9 @@
       if (!window.BeadsEnhance) {
         throw new Error('enhance.js 未加载，请确认它与本页面在同一目录');
       }
+      if (!window.BeadsMatting) {
+        throw new Error('matting.js 未加载，请确认它与本页面在同一目录');
+      }
       // 预设下拉
       window.BeadsEnhance.PRESET_ORDER.forEach(function (name) {
         var opt = document.createElement('option');
@@ -116,7 +121,7 @@
       if (presetSelect.value === '人像转插画') outlineCheck.checked = true;
     });
     ['change', 'input'].forEach(function (ev) {
-      [gridSelect, gridCustom, maxGridInput, brandSelect, presetSelect, subsetInput, methodKmeans, methodNearest, kInput, labelCheck,
+      [gridSelect, gridCustom, maxGridInput, brandSelect, presetSelect, subsetInput, methodKmeans, methodNearest, deltaSelect, mattingCheck, kInput, labelCheck,
        cleanCheck, outlineCheck, outlineThresh]
         .forEach(function (el) { el.addEventListener(ev, generate); });
     });
@@ -266,6 +271,77 @@
     }
   }
 
+  // 抠图 → 再走预设/缩放。返回 {rawRGBA, steps}
+  async function preparePixels(file, N, preset) {
+    var steps = [];
+    var doMat = mattingCheck && mattingCheck.checked;
+    if (preset === '通用' && !doMat) {
+      return { rawRGBA: await readImageData(file, N), steps: steps };
+    }
+    var img = await loadImage(file);
+    var workSize = 512;
+    var matMode = 'auto';
+    if (doMat) {
+      var matted = window.BeadsMatting.matteImage(img, workSize, matMode);
+      steps.push('背景抠图(' + matted.mode + ')');
+      // 把抠图结果画到临时 canvas，作为增强输入
+      var mc = document.createElement('canvas');
+      mc.width = mc.height = workSize;
+      mc.getContext('2d').putImageData(matted.imageData, 0, 0);
+      // 透明区填白，供 enhance 用；保留 alpha 通道在最终 N×N
+      var whiteBg = document.createElement('canvas');
+      whiteBg.width = whiteBg.height = workSize;
+      var wctx = whiteBg.getContext('2d');
+      wctx.fillStyle = '#ffffff';
+      wctx.fillRect(0, 0, workSize, workSize);
+      wctx.drawImage(mc, 0, 0);
+      // 伪造 Image-like：用 canvas 作为 drawImage 源
+      var srcForEnhance = whiteBg;
+      // processImageWithPreset 需要 HTMLImageElement 的 naturalWidth；用临时 Image 从 dataURL
+      // 更稳：直接在 enhance 路径外处理——若通用仅抠图，缩到 N；否则用增强后再乘 alpha
+      if (preset === '通用') {
+        var small = document.createElement('canvas');
+        small.width = small.height = N;
+        var sctx = small.getContext('2d');
+        sctx.fillStyle = '#ffffff';
+        sctx.fillRect(0, 0, N, N);
+        sctx.drawImage(mc, 0, 0, N, N);
+        // 重新采样 alpha
+        var alphaC = document.createElement('canvas');
+        alphaC.width = alphaC.height = N;
+        alphaC.getContext('2d').drawImage(mc, 0, 0, N, N);
+        var out = sctx.getImageData(0, 0, N, N);
+        var a = alphaC.getContext('2d').getImageData(0, 0, N, N).data;
+        for (var i = 0; i < N * N; i++) out.data[i * 4 + 3] = a[i * 4 + 3];
+        return { rawRGBA: out.data, steps: steps };
+      }
+      // 非通用：从白底图创建 Image 再增强
+      var dataUrl = whiteBg.toDataURL('image/png');
+      var img2 = await new Promise(function (resolve, reject) {
+        var im = new Image();
+        im.onload = function () { resolve(im); };
+        im.onerror = reject;
+        im.src = dataUrl;
+      });
+      var enhanced = window.BeadsEnhance.processImageWithPreset(img2, preset, N, workSize);
+      steps = steps.concat(enhanced.steps || []);
+      // 将抠图 alpha 缩到 N 叠回去
+      var alphaSmall = document.createElement('canvas');
+      alphaSmall.width = alphaSmall.height = N;
+      alphaSmall.getContext('2d').drawImage(mc, 0, 0, N, N);
+      var a = alphaSmall.getContext('2d').getImageData(0, 0, N, N).data;
+      var out = enhanced.imageData;
+      for (var i = 0; i < N * N; i++) out.data[i * 4 + 3] = a[i * 4 + 3];
+      return { rawRGBA: out.data, steps: steps };
+    }
+    // 无抠图
+    if (preset === '通用') {
+      return { rawRGBA: await readImageData(file, N), steps: steps };
+    }
+    var enhanced = window.BeadsEnhance.processImageWithPreset(img, preset, N, 512);
+    return { rawRGBA: enhanced.imageData.data, steps: enhanced.steps || [] };
+  }
+
   // ---- 推荐网格：轻量扫描候选 N ----
   async function suggestGrid() {
     if (!currentFile) {
@@ -289,20 +365,14 @@
       floor = Math.min(floor, maxG);
       var thr = window.BeadsEnhance.AVG_DE_THRESHOLD || 15;
 
-      var img = await loadImage(currentFile);
+      var metric = deltaSelect ? deltaSelect.value : 'e2000';
       var rows = [];
       for (var ci = 0; ci < cands.length; ci++) {
         var N = cands[ci];
-        var rawRGBA, steps = [];
-        if (preset === '通用') {
-          rawRGBA = await readImageData(currentFile, N);
-        } else {
-          var enhanced = window.BeadsEnhance.processImageWithPreset(img, preset, N, 512);
-          rawRGBA = enhanced.imageData.data;
-          steps = enhanced.steps;
-        }
-        var res = window.BeadsCore.processImage(window.PALETTES, brand, only, rawRGBA, N, method, k, SEED, null);
-        rows.push({ N: N, beads: N * N, unique: res.unique, avgDE: res.avgDE, pass: res.avgDE <= thr });
+        var prep = await preparePixels(currentFile, N, preset);
+        var res = window.BeadsCore.processImage(window.PALETTES, brand, only, prep.rawRGBA, N, method, k, SEED, null, metric);
+        var beads = N * N - (res.empty || 0);
+        rows.push({ N: N, beads: beads, unique: res.unique, avgDE: res.avgDE, pass: res.avgDE <= thr });
       }
       var eligible = rows.filter(function (r) { return r.N >= floor && r.pass; });
       var recommended;
@@ -354,15 +424,9 @@
       var method = methodNearest.checked ? 'nearest' : 'kmeans';
       var k = parseInt(kInput.value, 10) || 16;
       var preset = presetSelect.value;
-      var rawRGBA, steps = [];
-      if (preset === '通用') {
-        rawRGBA = await readImageData(currentFile, N);
-      } else {
-        var img = await loadImage(currentFile);
-        var enhanced = window.BeadsEnhance.processImageWithPreset(img, preset, N, 512);
-        rawRGBA = enhanced.imageData.data;
-        steps = enhanced.steps;
-      }
+      var metric = deltaSelect ? deltaSelect.value : 'e2000';
+      var prep = await preparePixels(currentFile, N, preset);
+      var rawRGBA = prep.rawRGBA, steps = prep.steps;
       if (preset === '人像转插画' && !outlineCheck.dataset.userUnset) {
         outlineCheck.checked = true;
       }
@@ -374,13 +438,14 @@
           outlineThreshold: parseInt(outlineThresh.value, 10) || 45
         };
       }
-      var res = window.BeadsCore.processImage(window.PALETTES, brand, only, rawRGBA, N, method, k, SEED, post);
+      var res = window.BeadsCore.processImage(window.PALETTES, brand, only, rawRGBA, N, method, k, SEED, post, metric);
       var postSteps = [];
       if (post && post.clean) postSteps.push('去杂点');
       if (post && post.outline) postSteps.push('卡通描边');
       current = { grid: res.grid, counts: res.counts, colors: res.colors,
                   unique: res.unique, avgDE: res.avgDE, N: N, brand: brand,
-                  preset: preset, steps: steps, postSteps: postSteps };
+                  preset: preset, steps: steps, postSteps: postSteps,
+                  empty: res.empty || 0, metric: metric };
       renderAll();
     } catch (e) {
       showStatus('出错：' + e.message, true);
@@ -427,9 +492,12 @@
       : '';
     var postInfo = g.postSteps && g.postSteps.length ? ' ｜ 后处理 <b>' + g.postSteps.join('、') + '</b>' : '';
     var clampInfo = lastClamped ? ' <span class="bad">(已达上限 ' + (parseInt(maxGridInput.value, 10) || 60) + '，可在"网格上限"里调高)</span>' : '';
-    metricsEl.innerHTML = '网格 <b>' + g.N + '×' + g.N + '</b> = <b>' + (g.N * g.N) +
-      '</b> 颗豆 ｜ 用色 <b>' + g.unique + '</b> 种 ｜ 平均色差 ΔE = <b>' + g.avgDE.toFixed(1) + '</b> ' +
-      verdict + presetInfo + postInfo + clampInfo;
+    var beadN = g.N * g.N - (g.empty || 0);
+    var emptyInfo = g.empty ? ('（空白不拼 <b>' + g.empty + '</b>）') : '';
+    var metricInfo = ' ｜ 色差 <b>' + (g.metric === 'e76' ? 'ΔE76' : 'CIEDE2000') + '</b>';
+    metricsEl.innerHTML = '网格 <b>' + g.N + '×' + g.N + '</b> = <b>' + beadN +
+      '</b> 颗豆' + emptyInfo + ' ｜ 用色 <b>' + g.unique + '</b> 种 ｜ 平均色差 ΔE = <b>' + g.avgDE.toFixed(1) + '</b> ' +
+      verdict + metricInfo + presetInfo + postInfo + clampInfo;
     // 用量表
     usageTableBody.innerHTML = '';
     g.counts.forEach(function (c) {
@@ -474,8 +542,22 @@
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     var font = labels ? Math.max(7, Math.floor(cell / 2.6)) : 0;
     for (var r = 0; r < N; r++) for (var c = 0; c < N; c++) {
-      var idx = g.grid[r * N + c], hex = g.colors[idx][1];
+      var idx = g.grid[r * N + c];
       var x0 = pad + c * (cell + gap), y0 = pad + r * (cell + gap);
+      if (idx < 0) {
+        var sq = Math.max(2, cell >> 2);
+        for (var yy = 0; yy < cell; yy += sq) for (var xx = 0; xx < cell; xx += sq) {
+          ctx.fillStyle = ((xx / sq + yy / sq) & 1) ? '#fff' : '#ebebeb';
+          ctx.fillRect(x0 + xx, y0 + yy, Math.min(sq, cell - xx), Math.min(sq, cell - yy));
+        }
+        if (labels) {
+          ctx.fillStyle = '#888';
+          ctx.font = font + 'px sans-serif';
+          ctx.fillText('空', x0 + cell / 2, y0 + cell / 2 + 0.5);
+        }
+        continue;
+      }
+      var hex = g.colors[idx][1];
       ctx.fillStyle = hex;
       roundRect(ctx, x0, y0, cell, cell, cell * 0.22);
       if (labels) {
@@ -500,8 +582,21 @@
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     var labelFont = Math.max(8, Math.floor(cell / 4));
     for (var r = 0; r < N; r++) for (var c = 0; c < N; c++) {
-      var idx = g.grid[r * N + c], hex = g.colors[idx][1];
+      var idx = g.grid[r * N + c];
       var x0 = ruler + c * (cell + gap), y0 = ruler + r * (cell + gap);
+      if (idx < 0) {
+        var sq = Math.max(2, cell >> 2);
+        for (var yy = 0; yy < cell; yy += sq) for (var xx = 0; xx < cell; xx += sq) {
+          ctx.fillStyle = ((xx / sq + yy / sq) & 1) ? '#fff' : '#ebebeb';
+          ctx.fillRect(x0 + xx, y0 + yy, Math.min(sq, cell - xx), Math.min(sq, cell - yy));
+        }
+        ctx.strokeStyle = '#999'; ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, y0 + 0.5, cell - 1, cell - 1);
+        ctx.fillStyle = '#888';
+        ctx.font = labelFont + 'px sans-serif';
+        ctx.fillText('空', x0 + cell / 2, y0 + cell / 2 + 0.5);
+        continue;
+      }
+      var hex = g.colors[idx][1];
       ctx.fillStyle = hex; ctx.fillRect(x0, y0, cell, cell);
       ctx.strokeStyle = '#666'; ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, y0 + 0.5, cell - 1, cell - 1);
       ctx.fillStyle = textColor(hex);
@@ -517,7 +612,9 @@
     // 图例
     ctx.textAlign = 'left'; ctx.font = '13px sans-serif';
     ctx.fillStyle = '#1e1e1e';
-    ctx.fillText('用量清单（共 ' + (N * N) + ' 颗豆）', ruler, legendTop - 8);
+    var beadTotal = N * N - (g.empty || 0);
+    var emptyNote = g.empty ? ('，空白不拼 ' + g.empty) : '';
+    ctx.fillText('用量清单（共 ' + beadTotal + ' 颗豆' + emptyNote + '）', ruler, legendTop - 8);
     for (var i = 0; i < g.counts.length; i++) {
       var c = g.counts[i], y = legendTop + i * 20;
       ctx.fillStyle = c.hex; ctx.fillRect(ruler, y + 2, 16, 16);

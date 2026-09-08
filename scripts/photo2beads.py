@@ -3,7 +3,7 @@
 """
 photo2beads.py — 照片 → 拼豆图纸（M1 原型）
 
-管线：居中裁方 → LANCZOS 缩到 N×N → 量化到豆色（CIELAB ΔE）→ 输出图纸 + 用量清单
+管线：可选抠图 → 预设增强 → 缩到 N×N → 量化到豆色（默认 CIEDE2000）→ 输出图纸 + 用量清单
 
 依赖：Pillow、numpy（轻量，可离线安装）
 
@@ -29,6 +29,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from enhance import PRESETS, PRESET_GRID_FLOOR, apply_preset
+from matting import apply_matting
 
 # 色号库路径（项目数据资产，由 parse_palette.py 生成）
 PALETTE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "bead_palettes.json")
@@ -67,6 +68,63 @@ def delta_e76(a, b):
     return np.sqrt(np.sum((a - b) ** 2, axis=-1))
 
 
+def delta_e2000(lab1, lab2, kL=1.0, kC=1.0, kH=1.0):
+    """CIEDE2000 色差（Sharma et al.）。支持广播，末维为 Lab。"""
+    lab1 = np.asarray(lab1, dtype=np.float64)
+    lab2 = np.asarray(lab2, dtype=np.float64)
+    L1, a1, b1 = lab1[..., 0], lab1[..., 1], lab1[..., 2]
+    L2, a2, b2 = lab2[..., 0], lab2[..., 1], lab2[..., 2]
+    C1 = np.sqrt(a1 * a1 + b1 * b1)
+    C2 = np.sqrt(a2 * a2 + b2 * b2)
+    Cbar = 0.5 * (C1 + C2)
+    Cbar7 = Cbar ** 7
+    G = 0.5 * (1.0 - np.sqrt(Cbar7 / (Cbar7 + 25.0 ** 7)))
+    a1p = (1.0 + G) * a1
+    a2p = (1.0 + G) * a2
+    C1p = np.sqrt(a1p * a1p + b1 * b1)
+    C2p = np.sqrt(a2p * a2p + b2 * b2)
+    h1p = np.degrees(np.arctan2(b1, a1p)) % 360.0
+    h2p = np.degrees(np.arctan2(b2, a2p)) % 360.0
+    dLp = L2 - L1
+    dCp = C2p - C1p
+    dhp = h2p - h1p
+    dhp = np.where((C1p * C2p) == 0, 0.0, dhp)
+    dhp = np.where(dhp > 180, dhp - 360, dhp)
+    dhp = np.where(dhp < -180, dhp + 360, dhp)
+    dHp = 2.0 * np.sqrt(C1p * C2p) * np.sin(np.radians(dhp) / 2.0)
+    Lbar = 0.5 * (L1 + L2)
+    Cbarp = 0.5 * (C1p + C2p)
+    hsum = h1p + h2p
+    hbar = np.where((C1p * C2p) == 0, hsum, hsum)
+    hbar = np.where((np.abs(h1p - h2p) > 180) & (hsum < 360), (hsum + 360) / 2.0, hbar)
+    hbar = np.where((np.abs(h1p - h2p) > 180) & (hsum >= 360), (hsum - 360) / 2.0, hbar)
+    hbar = np.where(np.abs(h1p - h2p) <= 180, hsum / 2.0, hbar)
+    T = (1.0 - 0.17 * np.cos(np.radians(hbar - 30.0))
+         + 0.24 * np.cos(np.radians(2.0 * hbar))
+         + 0.32 * np.cos(np.radians(3.0 * hbar + 6.0))
+         - 0.20 * np.cos(np.radians(4.0 * hbar - 63.0)))
+    dRo = 30.0 * np.exp(-((hbar - 275.0) / 25.0) ** 2)
+    Cbarp7 = Cbarp ** 7
+    RC = 2.0 * np.sqrt(Cbarp7 / (Cbarp7 + 25.0 ** 7))
+    SL = 1.0 + (0.015 * (Lbar - 50.0) ** 2) / np.sqrt(20.0 + (Lbar - 50.0) ** 2)
+    SC = 1.0 + 0.045 * Cbarp
+    SH = 1.0 + 0.015 * Cbarp * T
+    RT = -np.sin(np.radians(2.0 * dRo)) * RC
+    return np.sqrt(
+        (dLp / (kL * SL)) ** 2
+        + (dCp / (kC * SC)) ** 2
+        + (dHp / (kH * SH)) ** 2
+        + RT * (dCp / (kC * SC)) * (dHp / (kH * SH))
+    )
+
+
+def delta_e(a, b, metric="e2000"):
+    """统一入口：metric in {e76, e2000}。"""
+    if metric == "e76":
+        return delta_e76(a, b)
+    return delta_e2000(a, b)
+
+
 # ---------------------------------------------------------------- 色板
 def load_palette(brand, only=None):
     """读取色板 -> [(code, hex), ...]。only: 逗号分隔的色号子集（不填=全色板）。"""
@@ -84,33 +142,72 @@ def load_palette(brand, only=None):
 
 
 # ---------------------------------------------------------------- 量化
-def quantize_nearest(lab_img, pal_lab):
-    """方案A：每个格子直接找 LAB 最近豆色。"""
+def quantize_nearest(lab_img, pal_lab, metric="e2000", alpha=None):
+    """方案A：每个格子找色差最近豆色。alpha<128 → -1（空白不拼）。"""
     flat = lab_img.reshape(-1, 3)
-    d = np.sum((flat[:, None, :] - pal_lab[None, :, :]) ** 2, axis=-1)
-    return d.argmin(axis=-1).reshape(lab_img.shape[:2])
+    if metric == "e76":
+        d = np.sum((flat[:, None, :] - pal_lab[None, :, :]) ** 2, axis=-1)
+        idx = d.argmin(axis=-1)
+    else:
+        # 分批避免超大内存：每批像素
+        batch = 4096
+        parts = []
+        for i in range(0, len(flat), batch):
+            chunk = flat[i:i + batch]
+            d = delta_e2000(chunk[:, None, :], pal_lab[None, :, :])
+            parts.append(d.argmin(axis=-1))
+        idx = np.concatenate(parts)
+    grid = idx.reshape(lab_img.shape[:2]).astype(np.int32)
+    if alpha is not None:
+        a = np.asarray(alpha).reshape(lab_img.shape[:2])
+        grid = grid.copy()
+        grid[a < 128] = -1
+    return grid
 
 
-def quantize_kmeans(lab_img, pal_lab, k, seed):
-    """方案B：k-means 主色聚类，再映射每个主色到最近豆色（照片推荐）。"""
+def quantize_kmeans(lab_img, pal_lab, k, seed, metric="e2000", alpha=None):
+    """方案B：k-means 主色聚类，再映射每个主色到最近豆色（照片推荐）。
+    簇内距离仍用欧氏（稳定快）；簇→色板用 metric。
+    """
     flat = lab_img.reshape(-1, 3).astype(np.float64)
+    a_flat = None
+    if alpha is not None:
+        a_flat = np.asarray(alpha).reshape(-1)
+        valid = a_flat >= 128
+        if not valid.any():
+            return np.full(lab_img.shape[:2], -1, dtype=np.int32)
+        work = flat[valid]
+    else:
+        valid = None
+        work = flat
     rng = np.random.default_rng(seed)
-    centers = flat[rng.choice(len(flat), k, replace=False)].copy()
+    kk = min(k, len(work))
+    centers = work[rng.choice(len(work), kk, replace=False)].copy()
     for _ in range(30):
-        d = np.sum((flat[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
+        d = np.sum((work[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
         labels = d.argmin(axis=-1)
         new_centers = centers.copy()
-        for i in range(k):
+        for i in range(kk):
             m = labels == i
             if m.any():
-                new_centers[i] = flat[m].mean(axis=0)
+                new_centers[i] = work[m].mean(axis=0)
         if np.allclose(new_centers, centers):
             centers = new_centers
             break
         centers = new_centers
     # 每个主色映射到最近豆色
-    cd = np.sum((centers[:, None, :] - pal_lab[None, :, :]) ** 2, axis=-1)
-    return cd.argmin(axis=-1)[labels].reshape(lab_img.shape[:2])
+    if metric == "e76":
+        cd = np.sum((centers[:, None, :] - pal_lab[None, :, :]) ** 2, axis=-1)
+        center_bead = cd.argmin(axis=-1)
+    else:
+        cd = delta_e2000(centers[:, None, :], pal_lab[None, :, :])
+        center_bead = cd.argmin(axis=-1)
+    mapped = center_bead[labels]
+    if valid is None:
+        return mapped.reshape(lab_img.shape[:2]).astype(np.int32)
+    out = np.full(flat.shape[0], -1, dtype=np.int32)
+    out[valid] = mapped
+    return out.reshape(lab_img.shape[:2])
 
 
 # ---------------------------------------------------------------- 像素级后处理
@@ -121,37 +218,44 @@ def luminance_hex(hexc):
 
 def clean_isolated(grid):
     """去孤立杂点：只清"嵌在实心区里的散点"——周围 8 格无同色，且某一邻域色占绝对多数(≥半)。
-    保护线条/纹理/过渡色，卡通插画这类本就平滑的图不会误删细节。"""
+    保护线条/纹理/过渡色；跳过空白格(-1)。"""
     n = grid.shape[0]
     out = grid.copy()
     for y in range(n):
         for x in range(n):
+            center = grid[y, x]
+            if center < 0:
+                continue
             y0, y1 = max(0, y - 1), min(n - 1, y + 1)
             x0, x1 = max(0, x - 1), min(n - 1, x + 1)
             nb = grid[y0:y1 + 1, x0:x1 + 1]
             if nb.size <= 1:
                 continue
-            center = grid[y, x]
             if (nb != center).sum() == nb.size - 1:  # 所有邻域都不同色 → 候选孤立
-                vals, cnts = np.unique(nb, return_counts=True)
+                pos = nb[nb >= 0]
+                if pos.size == 0:
+                    continue
+                vals, cnts = np.unique(pos, return_counts=True)
                 if int(cnts.max()) >= max(3, nb.size // 2):  # 邻域主色占多数才替换(保护线条)
                     out[y, x] = vals[int(np.argmax(cnts))]
     return out
 
 
 def add_outline(grid, palette, threshold=45):
-    """卡通描边：4 邻域明暗差超过阈值 → 涂成色板最深色（形成轮廓线）。"""
+    """卡通描边：4 邻域明暗差超过阈值 → 涂成色板最深色（形成轮廓线）。跳过空白格。"""
     n = grid.shape[0]
     lums = np.array([luminance_hex(c[1]) for c in palette])
     dark = int(np.argmin(lums))
     out = grid.copy()
     for y in range(n):
         for x in range(n):
+            if grid[y, x] < 0:
+                continue
             L = lums[grid[y, x]]
             md = 0.0
             for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 ny, nx = y + dy, x + dx
-                if 0 <= ny < n and 0 <= nx < n:
+                if 0 <= ny < n and 0 <= nx < n and grid[ny, nx] >= 0:
                     md = max(md, abs(L - lums[grid[ny, nx]]))
             if md > threshold:
                 out[y, x] = dark
@@ -159,8 +263,18 @@ def add_outline(grid, palette, threshold=45):
 
 
 # ---------------------------------------------------------------- 绘图
+def _draw_checker(d, x0, y0, cell, sq=None):
+    """空白格棋盘底。"""
+    sq = sq or max(2, cell // 4)
+    for yy in range(0, cell, sq):
+        for xx in range(0, cell, sq):
+            lite = ((xx // sq) + (yy // sq)) % 2 == 0
+            fill = (235, 235, 235) if lite else (255, 255, 255)
+            d.rectangle([x0 + xx, y0 + yy, x0 + min(xx + sq, cell) - 1, y0 + min(yy + sq, cell) - 1], fill=fill)
+
+
 def draw_preview(grid, palette, cell, labels=False):
-    """圆角豆粒风格预览图，接近成品观感。labels=True 时给每颗豆标注色号。"""
+    """圆角豆粒风格预览图，接近成品观感。labels=True 时给每颗豆标注色号。空白格(-1)画棋盘。"""
     n = grid.shape[0]
     gap = max(2, cell // 8)
     pad = gap
@@ -173,10 +287,19 @@ def draw_preview(grid, palette, cell, labels=False):
         for c in range(n):
             x0 = pad + c * (cell + gap)
             y0 = pad + r * (cell + gap)
-            hexc = palette[grid[r, c]][1]
+            idx = int(grid[r, c])
+            if idx < 0:
+                _draw_checker(d, x0, y0, cell)
+                if labels:
+                    code = "空"
+                    tw = d.textlength(code, font=label_font)
+                    d.text((x0 + (cell - tw) / 2, y0 + (cell - label_font.size) / 2), code,
+                           fill=(120, 120, 120), font=label_font)
+                continue
+            hexc = palette[idx][1]
             d.rounded_rectangle([x0, y0, x0 + cell, y0 + cell], radius=radius, fill=hexc)
             if labels:
-                code = palette[grid[r, c]][0]
+                code = palette[idx][0]
                 tw = d.textlength(code, font=label_font)
                 d.text((x0 + (cell - tw) / 2, y0 + (cell - label_font.size) / 2), code,
                        fill=_text_color(hexc), font=label_font)
@@ -214,10 +337,19 @@ def draw_spec(grid, palette, counts):
         for c in range(n):
             x0 = ruler + c * (cell + gap)
             y0 = ruler + r * (cell + gap)
-            hexc = palette[grid[r, c]][1]
+            idx = int(grid[r, c])
+            if idx < 0:
+                _draw_checker(d, x0, y0, cell)
+                d.rectangle([x0, y0, x0 + cell, y0 + cell], outline=(160, 160, 160), width=1)
+                code = "空"
+                tw = d.textlength(code, font=label_font)
+                d.text((x0 + (cell - tw) / 2, y0 + (cell - label_font.size) / 2), code,
+                       fill=(120, 120, 120), font=label_font)
+                continue
+            hexc = palette[idx][1]
             d.rectangle([x0, y0, x0 + cell, y0 + cell], fill=hexc, outline=(60, 60, 60), width=1)
             # 色号标注 + 自适应文字颜色
-            code = palette[grid[r, c]][0]
+            code = palette[idx][0]
             tw = d.textlength(code, font=label_font)
             d.text((x0 + (cell - tw) / 2, y0 + (cell - label_font.size) / 2), code,
                    fill=_text_color(hexc), font=label_font)
@@ -231,7 +363,10 @@ def draw_spec(grid, palette, counts):
         d.text((ruler - d.textlength(str(i), font=ruler_font) - 2, ty - 6), str(i),
                fill=(60, 60, 60), font=ruler_font)
     # 图例
-    d.text((ruler, legend_top - 16), f"用量清单（共 {sum(cnt for _, _, cnt in counts)} 颗豆）",
+    bead_total = sum(cnt for _, _, cnt in counts)
+    empty_n = int((grid < 0).sum()) if hasattr(grid, 'shape') else 0
+    empty_note = f"，空白不拼 {empty_n}" if empty_n else ""
+    d.text((ruler, legend_top - 16), f"用量清单（共 {bead_total} 颗豆{empty_note}）",
            fill=(30, 30, 30), font=legend_font)
     for i, (code, hexc, cnt) in enumerate(legend_lines):
         y = legend_top + i * lh
@@ -260,29 +395,40 @@ def resize_for_beads(img, n):
     return img.resize((n, n), Image.LANCZOS)
 
 
-def evaluate_grid(img_enhanced, n, palette, pal_lab, method, k, seed):
+def evaluate_grid(img_enhanced, n, palette, pal_lab, method, k, seed, metric="e2000"):
     """对已增强方形图评估某一 N：量化后返回 avgΔE / unique / beads。"""
-    small = resize_for_beads(img_enhanced, n)
-    rgb = np.asarray(small)
+    small = resize_for_beads(img_enhanced.convert("RGBA") if img_enhanced.mode == "RGBA" else img_enhanced, n)
+    arr = np.asarray(small)
+    if arr.shape[-1] == 4:
+        rgb, alpha = arr[..., :3], arr[..., 3]
+    else:
+        rgb, alpha = arr, None
     lab_img = srgb_to_lab(rgb)
     if method == "nearest":
-        grid = quantize_nearest(lab_img, pal_lab)
+        grid = quantize_nearest(lab_img, pal_lab, metric=metric, alpha=alpha)
     else:
         kk = min(k, min(n * n, len(palette)))
-        grid = quantize_kmeans(lab_img, pal_lab, kk, seed)
-    avg_de = float(delta_e76(lab_img, pal_lab[grid]).mean())
-    unique = int(len(np.unique(grid)))
+        grid = quantize_kmeans(lab_img, pal_lab, kk, seed, metric=metric, alpha=alpha)
+    mask = grid >= 0
+    if mask.any():
+        avg_de = float(delta_e(lab_img[mask], pal_lab[grid[mask]], metric).mean())
+    else:
+        avg_de = 0.0
+    unique = int(len(np.unique(grid[mask]))) if mask.any() else 0
+    beads = int(mask.sum())
     return {
         "N": n,
-        "beads": n * n,
+        "beads": beads,
         "avg_de": avg_de,
         "unique": unique,
         "pass": avg_de <= AVG_DE_THRESHOLD,
+        "empty": int((~mask).sum()) if alpha is not None else 0,
     }
 
 
 def suggest_grid(image_path, brand, method, k, only, seed, preset, max_grid,
-                 candidates=None, cartoon_levels=10):
+                 candidates=None, cartoon_levels=10, metric="e2000",
+                 matting=False, matting_mode="auto"):
     """扫描候选网格，返回 (rows, recommended_N, floor)。
 
     推荐规则：最小 N ≥ 主体下限 且 avgΔE ≤ 15；若无一通过则取下限以上 ΔE 最低者。
@@ -297,13 +443,19 @@ def suggest_grid(image_path, brand, method, k, only, seed, preset, max_grid,
     floor = PRESET_GRID_FLOOR.get(preset, 29)
     floor = min(floor, max_grid)
 
-    img = Image.open(image_path).convert("RGB")
-    img = apply_preset(img, preset, cartoon_levels=cartoon_levels)
+    img0 = Image.open(image_path).convert("RGB")
+    src_size = img0.size
+    steps = []
+    img_rgb, alpha, _ = _prepare_with_matting(img0, matting, matting_mode, steps)
+    img = apply_preset(img_rgb, preset, cartoon_levels=cartoon_levels)
+    alpha = _align_alpha_after_preset(alpha, src_size, img)
+    if alpha is not None:
+        img = Image.merge("RGBA", (*img.split(), alpha))
     palette = load_palette(brand, only)
     pal_rgb = np.array([list(bytes.fromhex(c[1][1:])) for c in palette], dtype=np.uint8)
     pal_lab = srgb_to_lab(pal_rgb)
 
-    rows = [evaluate_grid(img, n, palette, pal_lab, method, k, seed) for n in cands]
+    rows = [evaluate_grid(img, n, palette, pal_lab, method, k, seed, metric=metric) for n in cands]
 
     eligible = [r for r in rows if r["N"] >= floor and r["pass"]]
     if eligible:
@@ -327,16 +479,50 @@ def print_suggest_table(rows, recommended, floor, preset):
     return recommended
 
 
+def _prepare_with_matting(img_rgb, matting, matting_mode, steps):
+    """matting → RGBA；返回 (rgb_for_enhance: RGB, alpha_L: PIL L or None, mode_used)."""
+    if not matting:
+        return img_rgb, None, None
+    rgba, used = apply_matting(img_rgb, mode=matting_mode, as_rgba=True)
+    steps.append((f"背景抠图({used})", False))
+    arr = np.asarray(rgba)
+    alpha = Image.fromarray(arr[..., 3], "L")
+    rgb = arr[..., :3].copy()
+    rgb[arr[..., 3] < 128] = 255  # 透明区填白再增强，避免污染
+    return Image.fromarray(rgb, "RGB"), alpha, used
+
+
+def _align_alpha_after_preset(alpha, src_size, out_img):
+    """增强会居中裁方；对 alpha 做同样中心裁方再缩到 out 尺寸。"""
+    if alpha is None:
+        return None
+    ow, oh = src_size
+    side = min(ow, oh)
+    left = (ow - side) // 2
+    top = (oh - side) // 2
+    a = alpha.crop((left, top, left + side, top + side))
+    return a.resize(out_img.size, Image.NEAREST)
+
+
 # ---------------------------------------------------------------- 主流程
 def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, labels=False, preset='通用',
-            clean=False, outline=False, outline_threshold=45, cartoon_levels=10):
-    # 1. 读图 + 预设增强(裁剪+柔化/卡通化等) + 缩小
-    img = Image.open(image_path).convert("RGB")
+            clean=False, outline=False, outline_threshold=45, cartoon_levels=10,
+            metric="e2000", matting=False, matting_mode="auto"):
+    # 顺序：matting → preset enhance → resize → quantize
+    img0 = Image.open(image_path).convert("RGB")
     steps = []
-    img = apply_preset(img, preset, log=lambda m, is_err=False: steps.append((m, is_err)),
+    src_size = img0.size
+    img_rgb, alpha, _mat_used = _prepare_with_matting(img0, matting, matting_mode, steps)
+    img = apply_preset(img_rgb, preset, log=lambda m, is_err=False: steps.append((m, is_err)),
                        cartoon_levels=cartoon_levels)
+    alpha = _align_alpha_after_preset(alpha, src_size, img)
     img = resize_for_beads(img, n)
-    rgb = np.asarray(img)  # (n, n, 3) uint8
+    if alpha is not None:
+        alpha = alpha.resize((n, n), Image.NEAREST)
+        alpha_arr = np.asarray(alpha)
+    else:
+        alpha_arr = None
+    rgb = np.asarray(img.convert("RGB"))  # (n, n, 3) uint8
 
     # 人像转插画：默认建议开启像素级描边（可被显式 --outline/--no-outline 覆盖）
     if outline is None:
@@ -350,10 +536,10 @@ def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, label
 
     # 3. 量化
     if method == "nearest":
-        grid = quantize_nearest(lab_img, pal_lab)
+        grid = quantize_nearest(lab_img, pal_lab, metric=metric, alpha=alpha_arr)
     else:
         k = min(k, min(n * n, len(palette)))
-        grid = quantize_kmeans(lab_img, pal_lab, k, seed)
+        grid = quantize_kmeans(lab_img, pal_lab, k, seed, metric=metric, alpha=alpha_arr)
 
     # 3.5 像素级后处理
     post_steps = []
@@ -364,16 +550,22 @@ def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, label
         grid = add_outline(grid, palette, outline_threshold)
         post_steps.append(f"卡通描边(阈值{outline_threshold})")
 
-    # 4. 统计与报告
+    # 4. 统计与报告（空白不拼不计入用量）
     used = grid.ravel()
+    empty_n = int((used < 0).sum())
     counts = []
     for i in range(len(palette)):
         c = int((used == i).sum())
         if c:
             counts.append((palette[i][0], palette[i][1], c))
     counts.sort(key=lambda x: -x[2])
-    avg_de = float(delta_e76(lab_img, pal_lab[grid]).mean())
+    mask = grid >= 0
+    if mask.any():
+        avg_de = float(delta_e(lab_img[mask], pal_lab[grid[mask]], metric).mean())
+    else:
+        avg_de = 0.0
     unique = len(counts)
+    bead_n = int(mask.sum())
 
     # 5. 输出
     preview_cell = max(cell, 28) if labels else cell
@@ -383,14 +575,18 @@ def process(image_path, n, brand, method, k, only, out_prefix, cell, seed, label
         w = csv.writer(f)
         w.writerow(["color_code", "hex", "count"])
         w.writerows(counts)
+        if empty_n:
+            w.writerow(["EMPTY", "#透明/不拼", empty_n])
 
-    print(f"网格: {n}×{n} = {n * n} 颗豆  |  色板: {brand}（{len(palette)} 色可用，实际用 {unique} 色）")
+    metric_name = "CIEDE2000" if metric == "e2000" else "ΔE76"
+    print(f"网格: {n}×{n} = {n * n} 格（实拼 {bead_n} 颗" + (f"，空白不拼 {empty_n}" if empty_n else "") +
+          f"）  |  色板: {brand}（{len(palette)} 色可用，实际用 {unique} 色）")
     print(f"预设: {preset}" + (f" ｜ 处理: {'；'.join(m for m, e in steps if not e)}" if steps else ""))
     if post_steps:
         print("后处理: " + "、".join(post_steps))
     if any(e for _, e in steps):
         print("[警告] " + "；".join(m for m, e in steps if e))
-    print(f"量化方法: {method}{'(k=' + str(k) + ')' if method == 'kmeans' else ''}  |  平均每豆色差 ΔE = {avg_de:.1f}")
+    print(f"量化方法: {method}{'(k=' + str(k) + ')' if method == 'kmeans' else ''}  |  色差 {metric_name}  |  平均每豆色差 ΔE = {avg_de:.1f}")
     print(f"输出: {out_prefix}_preview.png / _spec.png / _usage.csv")
     if avg_de > 15 and outline:
         print(f"[提示] avgΔE={avg_de:.1f} 因卡通描边而偏高（描边是艺术化改动），属正常现象。")
@@ -428,6 +624,12 @@ def main():
     ap.add_argument("--apply-suggest", action="store_true",
                     help="先扫描推荐网格，再用推荐 N 跑完整流程")
     ap.add_argument("--seed", type=int, default=42, help="随机种子，保证可复现")
+    ap.add_argument("--delta", choices=["e76", "e2000"], default="e2000",
+                    help="色差度量：e2000=CIEDE2000(默认) / e76=ΔE76(A/B)")
+    ap.add_argument("--matting", action="store_true", help="开启背景抠图（人像/花/动物推荐）")
+    ap.add_argument("--no-matting", action="store_true", help="关闭背景抠图（默认关闭，风景建议关）")
+    ap.add_argument("--matting-mode", choices=["auto", "corner", "grabcut", "saliency"], default="auto",
+                    help="抠图策略：auto|corner|grabcut|saliency")
     args = ap.parse_args()
 
     max_grid = min(args.max_grid, MAX_GRID_HARD)
@@ -440,10 +642,13 @@ def main():
 
     outline = False if args.no_outline else (True if args.outline else None)
 
+    do_matting = bool(args.matting) and not args.no_matting
+
     if args.suggest_grid or args.apply_suggest:
         rows, recommended, floor = suggest_grid(
             args.image, args.palette, args.method, args.k, args.only, args.seed,
-            args.preset, max_grid, cartoon_levels=args.cartoon_levels)
+            args.preset, max_grid, cartoon_levels=args.cartoon_levels,
+            metric=args.delta, matting=do_matting, matting_mode=args.matting_mode)
         print_suggest_table(rows, recommended, floor, args.preset)
         if args.suggest_grid and not args.apply_suggest:
             return
@@ -458,7 +663,8 @@ def main():
     process(args.image, args.N, args.palette, args.method, args.k,
             args.only, out_prefix, args.cell, args.seed, labels=args.labels, preset=args.preset,
             clean=args.clean, outline=outline, outline_threshold=args.outline_threshold,
-            cartoon_levels=args.cartoon_levels)
+            cartoon_levels=args.cartoon_levels, metric=args.delta,
+            matting=do_matting, matting_mode=args.matting_mode)
 
 
 if __name__ == "__main__":
