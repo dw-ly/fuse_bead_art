@@ -90,6 +90,7 @@
           <option value="29">29×29（841豆）</option>
           <option value="39">39×39（1521豆）</option>
           <option value="49">49×49（2401豆）</option>
+          <option value="59">59×59（3481豆）</option>
           <option value="60" selected>60×60（3600豆）</option>
           <option value="80">80×80（6400豆）</option>
           <option value="100">100×100（10000豆）</option>
@@ -112,9 +113,16 @@
       <label><input type="radio" name="method" id="method-kmeans" checked>主色聚类（照片推荐）</label>
       <label><input type="radio" name="method" id="method-nearest">最近色</label>
     </div>
+    <label class="row"><span>色差</span>
+      <select id="delta-select">
+        <option value="e2000" selected>CIEDE2000（默认）</option>
+        <option value="e76">ΔE76</option>
+      </select>
+    </label>
     <label class="row"><span>主色数 k</span>
       <input type="number" id="k-input" min="2" max="60" value="32">
     </label>
+    <label class="chk"><input type="checkbox" id="matting-check">背景抠图（人像/花/动物推荐）</label>
     <label class="chk"><input type="checkbox" id="label-check">预览图标注色号</label>
 
     <h3>④ 后处理（像素级）</h3>
@@ -123,7 +131,9 @@
     <label class="row"><span>描边阈值（明暗差）</span>
       <input type="number" id="outline-thresh" min="10" max="150" value="45">
     </label>
+    <button id="suggest-btn" type="button" style="width:100%;margin-top:10px;padding:9px;border:1px solid #ff5e62;border-radius:8px;background:#fff;color:#d64;font-size:14px;font-weight:600;cursor:pointer;">推荐网格</button>
     <button id="gen-btn">生成图纸</button>
+    <div class="hint">「推荐网格」扫描 29/39/49/59/60 的 avgΔE，选最小可用 N。</div>
   </div>
 
   <div class="main">
@@ -162,6 +172,7 @@
 <script src="core.js"></script>
 <script src="zip.js"></script>
 <script src="enhance.js"></script>
+<script src="matting.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
